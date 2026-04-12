@@ -1,0 +1,4 @@
+[package]
+name = "nn"
+version = "0.1.0"
+description = "Neural network primitives for Almide — built on matrix stdlib"
