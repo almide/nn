@@ -1,0 +1,181 @@
+// nn.mel — Mel spectrogram for Whisper audio preprocessing
+//
+// Pipeline: audio samples → windowed frames → FFT → power spectrum → mel filterbank → log
+//
+// Whisper expects: 80 mel bands, 25ms windows, 10ms hop, 16kHz sample rate.
+
+import math
+import self.fft as fft
+
+// ── Mel scale conversion ──
+
+fn hz_to_mel(hz: Float) -> Float =
+  2595.0 * math.log10(1.0 + hz / 700.0)
+
+fn mel_to_hz(mel: Float) -> Float =
+  700.0 * (math.fpow(10.0, mel / 2595.0) - 1.0)
+
+// ── Mel filterbank ──
+//
+// Creates triangular filters spaced evenly on the mel scale.
+// n_mels: number of mel bands (80 for Whisper)
+// n_fft: FFT size (400 for Whisper's 25ms @ 16kHz)
+// sample_rate: audio sample rate (16000)
+
+fn linspace(start: Float, end: Float, n: Int) -> List[Float] =
+  if n <= 1 then [start]
+  else {
+    let step = (end - start) / int.to_float(n - 1)
+    list.range(0, n) |> list.map((i) => start + int.to_float(i) * step)
+  }
+
+fn create_mel_filters(n_mels: Int, n_fft: Int, sample_rate: Int) -> List[List[Float]] = {
+  let sr = int.to_float(sample_rate)
+  let n_freq = n_fft / 2 + 1
+
+  // Mel-spaced center frequencies
+  let mel_low = hz_to_mel(0.0)
+  let mel_high = hz_to_mel(sr / 2.0)
+  let mel_points = linspace(mel_low, mel_high, n_mels + 2)
+  let hz_points = list.map(mel_points, (m) => mel_to_hz(m))
+
+  // Convert Hz to FFT bin indices
+  let bin_points = list.map(hz_points, (hz) =>
+    float.to_int(hz * int.to_float(n_fft) / sr)
+  )
+
+  // Build triangular filters
+  list.range(0, n_mels) |> list.map((i) => {
+    let left = list.get(bin_points, i) |> option.unwrap_or(0)
+    let center = list.get(bin_points, i + 1) |> option.unwrap_or(0)
+    let right = list.get(bin_points, i + 2) |> option.unwrap_or(0)
+    list.range(0, n_freq) |> list.map((k) =>
+      if k < left then 0.0
+      else if k < center then
+        if center == left then 0.0
+        else int.to_float(k - left) / int.to_float(center - left)
+      else if k < right then
+        if right == center then 0.0
+        else int.to_float(right - k) / int.to_float(right - center)
+      else 0.0
+    )
+  })
+}
+
+// ── Windowing ──
+
+fn hann_window(size: Int) -> List[Float] =
+  list.range(0, size) |> list.map((i) =>
+    0.5 * (1.0 - math.cos(2.0 * math.pi() * int.to_float(i) / int.to_float(size - 1)))
+  )
+
+fn apply_window(samples: List[Float], window: List[Float]) -> List[Float] =
+  list.zip(samples, window) |> list.map((pair) => pair.0 * pair.1)
+
+// ── Frame extraction ──
+
+fn extract_frames(samples: List[Float], frame_size: Int, hop_size: Int) -> List[List[Float]] = {
+  let total = list.len(samples)
+  let n_frames = (total - frame_size) / hop_size + 1
+  list.range(0, n_frames) |> list.map((i) => {
+    let start = i * hop_size
+    list.slice(samples, start, start + frame_size)
+  })
+}
+
+// ── Full Mel spectrogram ──
+//
+// Returns Matrix-like: List[List[Float]] with shape (n_frames, n_mels)
+
+fn mel_spectrogram(
+  samples: List[Float],
+  sample_rate: Int,
+  n_fft: Int,
+  hop_size: Int,
+  n_mels: Int,
+) -> List[List[Float]] = {
+  let window = hann_window(n_fft)
+  let filters = create_mel_filters(n_mels, n_fft, sample_rate)
+  let padded_len = fft.next_power_of_2(n_fft)
+
+  let frames = extract_frames(samples, n_fft, hop_size)
+  list.map(frames, (frame) => {
+    // Apply window + zero-pad to power of 2
+    let windowed = apply_window(frame, window)
+    let padded = fft.zero_pad(windowed, padded_len)
+    // FFT → power spectrum
+    let spectrum = fft.power_spectrum(padded)
+    // Apply mel filterbank
+    list.map(filters, (filter) => {
+      let energy = list.zip(filter, spectrum)
+        |> list.fold(0.0, (acc, pair) => acc + pair.0 * pair.1)
+      // Log scale with floor to avoid log(0)
+      let floor = 0.000001
+      math.log(if energy > floor then energy else floor)
+    })
+  })
+}
+
+// ── Whisper-specific parameters ──
+
+fn whisper_mel(samples: List[Float]) -> List[List[Float]] =
+  mel_spectrogram(samples, 16000, 400, 160, 80)
+
+// ── Tests ──
+
+fn approx(a: Float, b: Float) -> Bool =
+  float.abs(a - b) < 0.01
+
+test "hz_to_mel and mel_to_hz roundtrip" {
+  let hz = 1000.0
+  let mel = hz_to_mel(hz)
+  let back = mel_to_hz(mel)
+  assert(approx(back, hz))
+}
+
+test "linspace basic" {
+  let xs = linspace(0.0, 10.0, 3)
+  assert_eq(list.len(xs), 3)
+  assert(approx(list.get(xs, 0) |> option.unwrap_or(0.0), 0.0))
+  assert(approx(list.get(xs, 1) |> option.unwrap_or(0.0), 5.0))
+  assert(approx(list.get(xs, 2) |> option.unwrap_or(0.0), 10.0))
+}
+
+test "hann_window endpoints are zero" {
+  let w = hann_window(8)
+  assert(approx(list.first(w) |> option.unwrap_or(1.0), 0.0))
+  assert(approx(list.last(w) |> option.unwrap_or(1.0), 0.0))
+}
+
+test "hann_window middle is 1" {
+  let w = hann_window(5)
+  // Middle of a 5-point Hann window should be 1.0
+  assert(approx(list.get(w, 2) |> option.unwrap_or(0.0), 1.0))
+}
+
+test "create_mel_filters shape" {
+  let filters = create_mel_filters(4, 16, 8000)
+  assert_eq(list.len(filters), 4)
+  // Each filter has n_fft/2 + 1 = 9 bins
+  let first = list.first(filters) |> option.unwrap_or([])
+  assert_eq(list.len(first), 9)
+}
+
+test "extract_frames count" {
+  let samples = list.range(0, 100) |> list.map((i) => int.to_float(i))
+  let frames = extract_frames(samples, 10, 5)
+  // (100 - 10) / 5 + 1 = 19 frames
+  assert_eq(list.len(frames), 19)
+}
+
+test "mel_spectrogram produces output" {
+  // 800 samples = 50ms @ 16kHz → should produce at least 1 frame
+  let samples = list.range(0, 800) |> list.map((i) =>
+    math.sin(2.0 * math.pi() * 440.0 * int.to_float(i) / 16000.0)
+  )
+  let spec = mel_spectrogram(samples, 16000, 400, 160, 10)
+  assert(list.len(spec) > 0)
+  // Each frame has 10 mel bands
+  let first_frame = list.first(spec) |> option.unwrap_or([])
+  assert_eq(list.len(first_frame), 10)
+}
