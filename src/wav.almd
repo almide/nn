@@ -1,0 +1,249 @@
+// nn.wav — WAV file parser
+//
+// Reads PCM audio from standard WAV files.
+// Whisper expects: 16kHz, mono, f32 normalized to [-1.0, 1.0].
+//
+// WAV format (RIFF):
+//   Bytes 0-3:   "RIFF"
+//   Bytes 4-7:   file size - 8
+//   Bytes 8-11:  "WAVE"
+//   Bytes 12+:   chunks (fmt, data)
+//
+// fmt chunk:
+//   audio_format: 1 = PCM
+//   num_channels: 1 = mono, 2 = stereo
+//   sample_rate:  e.g. 16000
+//   bits_per_sample: 16 or 32
+
+import fs
+
+type WavInfo = {
+  sample_rate: Int,
+  channels: Int,
+  bits_per_sample: Int,
+  num_samples: Int,
+}
+
+type WavData = {
+  info: WavInfo,
+  samples: List[Float],
+}
+
+// ── Internal helpers ──
+
+fn read_u16_le(data: Bytes, offset: Int) -> Int =
+  int.band((bytes.get(data, offset) ?? 0), 255) +
+  int.band((bytes.get(data, offset + 1) ?? 0), 255) * 256
+
+fn read_u32_le(data: Bytes, offset: Int) -> Int =
+  int.band((bytes.get(data, offset) ?? 0), 255) +
+  int.band((bytes.get(data, offset + 1) ?? 0), 255) * 256 +
+  int.band((bytes.get(data, offset + 2) ?? 0), 255) * 65536 +
+  int.band((bytes.get(data, offset + 3) ?? 0), 255) * 16777216
+
+fn read_i16_le(data: Bytes, offset: Int) -> Int = {
+  let raw = read_u16_le(data, offset)
+  if raw >= 32768 then raw - 65536 else raw
+}
+
+fn bytes_to_string(data: Bytes, offset: Int, len: Int) -> String =
+  list.range(offset, offset + len)
+    |> list.map((i) => string.from_codepoint(int.band((bytes.get(data, i) ?? 0), 255)))
+    |> string.join("")
+
+// ── Parser ──
+
+fn find_chunk(data: Bytes, chunk_id: String, start: Int) -> Option[Int] = {
+  let total = bytes.len(data)
+  // Iterative search to avoid TCO String/&str codegen issue
+  find_chunk_at(data, chunk_id, start, total)
+}
+
+fn find_chunk_at(data: Bytes, chunk_id: String, pos: Int, total: Int) -> Option[Int] = {
+  // Scan up to 100 chunks max (WAV files are simple)
+  let positions = list.range(0, 100)
+  list.fold(positions, (pos, none), (state, _) => {
+    let (p, found) = state
+    match found {
+      some(_) => state
+      none =>
+        if p + 8 > total then (p, none)
+        else {
+          let id = bytes_to_string(data, p, 4)
+          if id == chunk_id then (p, some(p))
+          else {
+            let size = read_u32_le(data, p + 4)
+            (p + 8 + size, none)
+          }
+        }
+    }
+  }).1
+}
+
+effect fn parse(data: Bytes) -> Result[WavData, String] = {
+  let total = bytes.len(data)
+  if total < 44 then err("WAV too short")
+  else {
+    let riff = bytes_to_string(data, 0, 4)
+    let wave = bytes_to_string(data, 8, 4)
+    if riff != "RIFF" then err("not a RIFF file")
+    else if wave != "WAVE" then err("not a WAVE file")
+    else match find_chunk(data, "fmt ", 12) {
+      none => err("no fmt chunk")
+      some(fmt_pos) => {
+        let audio_format = read_u16_le(data, fmt_pos + 8)
+        let channels = read_u16_le(data, fmt_pos + 10)
+        let sample_rate = read_u32_le(data, fmt_pos + 12)
+        let bits = read_u16_le(data, fmt_pos + 22)
+        if audio_format != 1 then err("not PCM (format=" + int.to_string(audio_format) + ")")
+        else match find_chunk(data, "data", 12) {
+          none => err("no data chunk")
+          some(data_pos) => {
+            let data_size = read_u32_le(data, data_pos + 4)
+            let bytes_per_sample = bits / 8
+            let num_samples = data_size / (bytes_per_sample * channels)
+            let pcm_start = data_pos + 8
+            let samples = extract_samples(data, pcm_start, num_samples, channels, bits)
+            ok(WavData {
+              info: WavInfo {
+                sample_rate: sample_rate,
+                channels: channels,
+                bits_per_sample: bits,
+                num_samples: num_samples,
+              },
+              samples: samples,
+            })
+          }
+        }
+      }
+    }
+  }
+}
+
+fn extract_samples(data: Bytes, start: Int, count: Int, channels: Int, bits: Int) -> List[Float] =
+  extract_samples_loop(data, start, count, channels, bits, 0, [])
+
+fn extract_samples_loop(data: Bytes, start: Int, count: Int, channels: Int, bits: Int, idx: Int, acc: List[Float]) -> List[Float] =
+  if idx >= count then acc
+  else {
+    let offset = start + idx * channels * (bits / 8)
+    let sample = if bits == 16 then {
+      let raw = read_i16_le(data, offset)
+      int.to_float(raw) / 32768.0
+    } else if bits == 32 then {
+      // 32-bit PCM
+      let raw = read_u32_le(data, offset)
+      int.to_float(raw) / 2147483648.0
+    } else {
+      // 8-bit unsigned
+      let raw = int.band((bytes.get(data, offset) ?? 0), 255)
+      (int.to_float(raw) - 128.0) / 128.0
+    }
+    // Mono: take first channel only
+    extract_samples_loop(data, start, count, channels, bits, idx + 1, acc + [sample])
+  }
+
+effect fn load(path: String) -> Result[WavData, String] =
+  match fs.read_bytes(path) {
+    err(e) => err("failed to read " + path + ": " + e)
+    ok(raw) => parse(bytes.from_list(raw))
+  }
+
+// ── Resampling (simple linear interpolation) ──
+
+fn resample(samples: List[Float], from_rate: Int, to_rate: Int) -> List[Float] = {
+  if from_rate == to_rate then samples
+  else {
+    let ratio = int.to_float(from_rate) / int.to_float(to_rate)
+    let out_len = float.to_int(int.to_float(list.len(samples)) / ratio)
+    resample_loop(samples, ratio, out_len, 0, [])
+  }
+}
+
+fn resample_loop(samples: List[Float], ratio: Float, out_len: Int, idx: Int, acc: List[Float]) -> List[Float] =
+  if idx >= out_len then acc
+  else {
+    let src_pos = int.to_float(idx) * ratio
+    let i0 = float.to_int(src_pos)
+    let frac = src_pos - int.to_float(i0)
+    let s0 = list.get(samples, i0) |> option.unwrap_or(0.0)
+    let s1 = list.get(samples, i0 + 1) |> option.unwrap_or(s0)
+    let sample = s0 + (s1 - s0) * frac
+    resample_loop(samples, ratio, out_len, idx + 1, acc + [sample])
+  }
+
+// ── Tests ──
+
+test "read_u16_le" {
+  let b = bytes.from_list([0x34, 0x12])
+  assert_eq(read_u16_le(b, 0), 0x1234)
+}
+
+test "read_u32_le" {
+  let b = bytes.from_list([0x78, 0x56, 0x34, 0x12])
+  assert_eq(read_u32_le(b, 0), 0x12345678)
+}
+
+test "read_i16_le positive" {
+  let b = bytes.from_list([0x00, 0x40])
+  assert_eq(read_i16_le(b, 0), 16384)
+}
+
+test "read_i16_le negative" {
+  let b = bytes.from_list([0x00, 0xC0])
+  assert_eq(read_i16_le(b, 0), -16384)
+}
+
+test "bytes_to_string" {
+  let b = bytes.from_list([82, 73, 70, 70])
+  assert_eq(bytes_to_string(b, 0, 4), "RIFF")
+}
+
+test "build minimal wav and parse" {
+  // Construct a minimal 16-bit mono 16kHz WAV with 4 samples
+  let header = bytes.from_list([
+    // RIFF header
+    82, 73, 70, 70,    // "RIFF"
+    44, 0, 0, 0,       // file size - 8 = 36 + 8 = 44
+    87, 65, 86, 69,    // "WAVE"
+    // fmt chunk
+    102, 109, 116, 32, // "fmt "
+    16, 0, 0, 0,       // chunk size = 16
+    1, 0,              // audio format = 1 (PCM)
+    1, 0,              // channels = 1 (mono)
+    128, 62, 0, 0,     // sample rate = 16000 (0x3E80)
+    0, 125, 0, 0,      // byte rate = 32000
+    2, 0,              // block align = 2
+    16, 0,             // bits per sample = 16
+    // data chunk
+    100, 97, 116, 97,  // "data"
+    8, 0, 0, 0,        // data size = 8 bytes (4 samples × 2 bytes)
+    // samples: 0, 16384, -16384, 0
+    0, 0,
+    0, 64,
+    0, 192,
+    0, 0,
+  ])
+  match parse(header) {
+    err(e) => { println("parse error: " + e); assert(false) }
+    ok(wav) => {
+      assert_eq(wav.info.sample_rate, 16000)
+      assert_eq(wav.info.channels, 1)
+      assert_eq(wav.info.bits_per_sample, 16)
+      assert_eq(wav.info.num_samples, 4)
+      assert_eq(list.len(wav.samples), 4)
+      // Sample 0: 0
+      assert_eq(list.get(wav.samples, 0) |> option.unwrap_or(1.0), 0.0)
+      // Sample 1: 16384/32768 = 0.5
+      assert_eq(list.get(wav.samples, 1) |> option.unwrap_or(0.0), 0.5)
+      // Sample 2: -16384/32768 = -0.5
+      assert_eq(list.get(wav.samples, 2) |> option.unwrap_or(0.0), -0.5)
+    }
+  }
+}
+
+test "resample identity" {
+  let s = [1.0, 2.0, 3.0, 4.0]
+  let r = resample(s, 16000, 16000)
+  assert_eq(list.len(r), 4)
+}

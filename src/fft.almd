@@ -1,0 +1,149 @@
+// nn.fft — Fast Fourier Transform (radix-2 Cooley-Tukey)
+//
+// Operates on List[Float] (real) or List[(Float, Float)] (complex).
+// Used for audio spectrogram computation.
+
+import math
+
+// ── Complex arithmetic ──
+
+type Complex = (Float, Float)
+
+fn c_add(a: Complex, b: Complex) -> Complex = (a.0 + b.0, a.1 + b.1)
+fn c_sub(a: Complex, b: Complex) -> Complex = (a.0 - b.0, a.1 - b.1)
+
+fn c_mul(a: Complex, b: Complex) -> Complex =
+  (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+
+fn c_mag(a: Complex) -> Float =
+  math.sqrt(a.0 * a.0 + a.1 * a.1)
+
+fn c_mag_sq(a: Complex) -> Float =
+  a.0 * a.0 + a.1 * a.1
+
+// ── FFT ──
+
+fn fft(input: List[Complex]) -> List[Complex] = {
+  let n = list.len(input)
+  if n <= 1 then input
+  else {
+    // Split into even and odd indices
+    let even = list.enumerate(input)
+      |> list.filter((e) => e.0 % 2 == 0)
+      |> list.map((e) => e.1)
+    let odd = list.enumerate(input)
+      |> list.filter((e) => e.0 % 2 != 0)
+      |> list.map((e) => e.1)
+    let fft_even = fft(even)
+    let fft_odd = fft(odd)
+    let half = n / 2
+    // Combine
+    combine(fft_even, fft_odd, n, half, 0, [], [])
+  }
+}
+
+fn combine(
+  fft_even: List[Complex], fft_odd: List[Complex],
+  n: Int, half: Int, k: Int,
+  first_half: List[Complex], second_half: List[Complex],
+) -> List[Complex] =
+  if k >= half then list.flatten([first_half, second_half])
+  else {
+    let angle = -2.0 * math.pi() * int.to_float(k) / int.to_float(n)
+    let twiddle = (math.cos(angle), math.sin(angle))
+    let e = list.get(fft_even, k) |> option.unwrap_or((0.0, 0.0))
+    let o = list.get(fft_odd, k) |> option.unwrap_or((0.0, 0.0))
+    let t = c_mul(twiddle, o)
+    combine(fft_even, fft_odd, n, half, k + 1,
+      first_half + [c_add(e, t)],
+      second_half + [c_sub(e, t)])
+  }
+
+// ── Real-valued FFT ──
+
+fn rfft(input: List[Float]) -> List[Complex] = {
+  let complex_input = list.map(input, (x) => (x, 0.0))
+  fft(complex_input)
+}
+
+// ── Power spectrum ──
+
+fn power_spectrum(input: List[Float]) -> List[Float] = {
+  let spectrum = rfft(input)
+  let half = list.len(spectrum) / 2 + 1
+  list.take(spectrum, half)
+    |> list.map((c) => c_mag_sq(c))
+}
+
+// ── Helpers ──
+
+fn next_power_of_2(n: Int) -> Int =
+  next_pow2_loop(1, n)
+
+fn next_pow2_loop(p: Int, n: Int) -> Int =
+  if p >= n then p else next_pow2_loop(p * 2, n)
+
+fn zero_pad(input: List[Float], target_len: Int) -> List[Float] = {
+  let current = list.len(input)
+  if current >= target_len then input
+  else input + list.map(list.range(0, target_len - current), (_) => 0.0)
+}
+
+// ── Tests ──
+
+fn approx(a: Float, b: Float) -> Bool =
+  float.abs(a - b) < 0.01
+
+test "fft of constant signal" {
+  // FFT of [1, 1, 1, 1] → [4, 0, 0, 0]
+  let input = [(1.0, 0.0), (1.0, 0.0), (1.0, 0.0), (1.0, 0.0)]
+  let result = fft(input)
+  assert(approx((list.get(result, 0) |> option.unwrap_or((0.0, 0.0))).0, 4.0))
+  assert(approx((list.get(result, 1) |> option.unwrap_or((1.0, 0.0))).0, 0.0))
+}
+
+test "fft of impulse" {
+  // FFT of [1, 0, 0, 0] → [1, 1, 1, 1]
+  let input = [(1.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
+  let result = fft(input)
+  assert(approx((list.get(result, 0) |> option.unwrap_or((0.0, 0.0))).0, 1.0))
+  assert(approx((list.get(result, 1) |> option.unwrap_or((0.0, 0.0))).0, 1.0))
+  assert(approx((list.get(result, 2) |> option.unwrap_or((0.0, 0.0))).0, 1.0))
+}
+
+test "fft preserves energy (Parseval)" {
+  // Sum of |x|^2 = (1/N) * sum of |X|^2
+  let input = [(1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (4.0, 0.0)]
+  let time_energy = list.fold(input, 0.0, (acc, c) => acc + c_mag_sq(c))
+  let freq = fft(input)
+  let freq_energy = list.fold(freq, 0.0, (acc, c) => acc + c_mag_sq(c)) / 4.0
+  assert(approx(time_energy, freq_energy))
+}
+
+test "rfft of sine wave has peak at frequency" {
+  // 8 samples of a sine wave at frequency 1 (one full cycle)
+  let n = 8
+  let input = list.range(0, n) |> list.map((i) =>
+    math.sin(2.0 * math.pi() * int.to_float(i) / int.to_float(n))
+  )
+  let spectrum = rfft(input)
+  // Frequency bin 1 should have the highest magnitude
+  let mag1 = c_mag(list.get(spectrum, 1) |> option.unwrap_or((0.0, 0.0)))
+  let mag0 = c_mag(list.get(spectrum, 0) |> option.unwrap_or((0.0, 0.0)))
+  let mag2 = c_mag(list.get(spectrum, 2) |> option.unwrap_or((0.0, 0.0)))
+  assert(mag1 > mag0)
+  assert(mag1 > mag2)
+}
+
+test "next_power_of_2" {
+  assert_eq(next_power_of_2(1), 1)
+  assert_eq(next_power_of_2(3), 4)
+  assert_eq(next_power_of_2(256), 256)
+  assert_eq(next_power_of_2(400), 512)
+}
+
+test "zero_pad" {
+  let padded = zero_pad([1.0, 2.0], 4)
+  assert_eq(list.len(padded), 4)
+  assert_eq(list.get(padded, 2) |> option.unwrap_or(1.0), 0.0)
+}
