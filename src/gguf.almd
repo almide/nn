@@ -1,0 +1,336 @@
+// nn.gguf — GGUF model file parser
+//
+// Reads tensor metadata and weight data from GGUF files (whisper.cpp format).
+// Supports F32 and F16 data types. Quantized types return raw bytes for now.
+//
+// GGUF spec: https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
+
+import fs
+import math
+
+// ── Types ──
+
+type GGUFHeader = {
+  version: Int,
+  tensor_count: Int,
+  metadata_count: Int,
+}
+
+type GGUFMetadata = {
+  entries: List[(String, GGUFValue)],
+}
+
+type GGUFValue =
+  | ValInt(Int)
+  | ValFloat(Float)
+  | ValBool(Bool)
+  | ValString(String)
+  | ValArray(List[GGUFValue])
+
+type TensorInfo = {
+  name: String,
+  dims: List[Int],
+  dtype: Int,
+  offset: Int,
+}
+
+type GGUFFile = {
+  header: GGUFHeader,
+  metadata: GGUFMetadata,
+  tensors: List[TensorInfo],
+  data_offset: Int,
+  raw: Bytes,
+}
+
+// ── Binary reading helpers ──
+
+fn r_u8(data: Bytes, pos: Int) -> Int =
+  int.band(bytes.get(data, pos) ?? 0, 255)
+
+fn r_u32(data: Bytes, pos: Int) -> Int =
+  r_u8(data, pos) + r_u8(data, pos + 1) * 256 +
+  r_u8(data, pos + 2) * 65536 + r_u8(data, pos + 3) * 16777216
+
+fn r_u64(data: Bytes, pos: Int) -> Int =
+  r_u32(data, pos) + r_u32(data, pos + 4) * 4294967296
+
+fn r_i32(data: Bytes, pos: Int) -> Int = {
+  let raw = r_u32(data, pos)
+  if raw >= 2147483648 then raw - 4294967296 else raw
+}
+
+fn r_f32(data: Bytes, pos: Int) -> Float =
+  int.bits_to_float(r_u32(data, pos))
+
+fn r_string(data: Bytes, pos: Int) -> (String, Int) = {
+  let len = r_u64(data, pos)
+  let raw = bytes.to_list(bytes.slice(data, pos + 8, pos + 8 + len))
+  (string.from_bytes(raw), pos + 8 + len)
+}
+
+// ── GGUF value type enum ──
+// 0=UINT8, 1=INT8, 2=UINT16, 3=INT16, 4=UINT32, 5=INT32,
+// 6=FLOAT32, 7=BOOL, 8=STRING, 9=ARRAY, 10=UINT64, 11=INT64, 12=FLOAT64
+
+fn read_value(data: Bytes, pos: Int, vtype: Int) -> (GGUFValue, Int) =
+  if vtype == 4 or vtype == 5 or vtype == 0 or vtype == 1 or vtype == 2 or vtype == 3 then
+    (ValInt(r_i32(data, pos)), pos + 4)
+  else if vtype == 10 or vtype == 11 then
+    (ValInt(r_u64(data, pos)), pos + 8)
+  else if vtype == 6 then
+    (ValFloat(r_f32(data, pos)), pos + 4)
+  else if vtype == 12 then
+    (ValFloat(r_f32(data, pos)), pos + 8)
+  else if vtype == 7 then
+    (ValBool(r_u8(data, pos) != 0), pos + 1)
+  else if vtype == 8 then {
+    let (s, next) = r_string(data, pos)
+    (ValString(s), next)
+  }
+  else if vtype == 9 then {
+    let arr_type = r_u32(data, pos)
+    let arr_count = r_u64(data, pos + 4)
+    read_array(data, pos + 12, arr_type, arr_count, [])
+  }
+  else (ValInt(0), pos + 4)
+
+fn read_array(data: Bytes, pos: Int, vtype: Int, remaining: Int, acc: List[GGUFValue]) -> (GGUFValue, Int) =
+  if remaining <= 0 then (ValArray(acc), pos)
+  else {
+    let (val, next) = read_value(data, pos, vtype)
+    read_array(data, next, vtype, remaining - 1, acc + [val])
+  }
+
+// ── Header parsing ──
+
+effect fn parse_header(data: Bytes) -> Result[(GGUFHeader, Int), String] = {
+  let magic = r_u32(data, 0)
+  if magic != 1179993927 then err("not a GGUF file (bad magic)")
+  else {
+    let version = r_u32(data, 4)
+    let tensor_count = r_u64(data, 8)
+    let metadata_count = r_u64(data, 16)
+    ok((GGUFHeader {
+      version: version,
+      tensor_count: tensor_count,
+      metadata_count: metadata_count,
+    }, 24))
+  }
+}
+
+// ── Metadata parsing ──
+
+fn parse_metadata_entries(data: Bytes, pos: Int, count: Int, acc: List[(String, GGUFValue)]) -> (List[(String, GGUFValue)], Int) =
+  if count <= 0 then (acc, pos)
+  else {
+    let (key, after_key) = r_string(data, pos)
+    let vtype = r_u32(data, after_key)
+    let (value, after_value) = read_value(data, after_key + 4, vtype)
+    parse_metadata_entries(data, after_value, count - 1, acc + [(key, value)])
+  }
+
+// ── Tensor info parsing ──
+
+fn read_dims(data: Bytes, start: Int, n: Int, acc: List[Int]) -> List[Int] =
+  if n <= 0 then acc
+  else read_dims(data, start + 8, n - 1, acc + [r_u64(data, start)])
+
+fn parse_tensor_infos(data: Bytes, pos: Int, count: Int, acc: List[TensorInfo]) -> (List[TensorInfo], Int) =
+  if count <= 0 then (acc, pos)
+  else {
+    let (name, after_name) = r_string(data, pos)
+    let n_dims = r_u32(data, after_name)
+    let dims = read_dims(data, after_name + 4, n_dims, [])
+    let after_dims = after_name + 4 + n_dims * 8
+    let dtype = r_u32(data, after_dims)
+    let offset = r_u64(data, after_dims + 4)
+    let info = TensorInfo { name: name, dims: dims, dtype: dtype, offset: offset }
+    parse_tensor_infos(data, after_dims + 12, count - 1, acc + [info])
+  }
+
+// ── Alignment ──
+
+fn align_to(pos: Int, alignment: Int) -> Int = {
+  let remainder = pos % alignment
+  if remainder == 0 then pos else pos + alignment - remainder
+}
+
+fn get_alignment(metadata: List[(String, GGUFValue)]) -> Int =
+  list.find(metadata, (entry) => entry.0 == "general.alignment")
+    |> option.map((entry) => match entry.1 {
+      ValInt(n) => n
+      _ => 32
+    })
+    |> option.unwrap_or(32)
+
+// ── Full file parsing ──
+
+effect fn parse(data: Bytes) -> Result[GGUFFile, String] =
+  match parse_header(data) {
+    err(e) => err(e)
+    ok(header_result) => {
+      let (header, pos) = header_result
+      let (meta_entries, after_meta) = parse_metadata_entries(data, pos, header.metadata_count, [])
+      let (tensor_infos, after_tensors) = parse_tensor_infos(data, after_meta, header.tensor_count, [])
+      let alignment = get_alignment(meta_entries)
+      let data_start = align_to(after_tensors, alignment)
+      ok(GGUFFile {
+        header: header,
+        metadata: GGUFMetadata { entries: meta_entries },
+        tensors: tensor_infos,
+        data_offset: data_start,
+        raw: data,
+      })
+    }
+  }
+
+effect fn load(path: String) -> Result[GGUFFile, String] =
+  match fs.read_bytes(path) {
+    err(e) => err("failed to read " + path + ": " + e)
+    ok(raw) => parse(bytes.from_list(raw))
+  }
+
+// ── Tensor data extraction ──
+
+fn tensor_element_size(dtype: Int) -> Int =
+  if dtype == 0 then 4      // F32
+  else if dtype == 1 then 2  // F16
+  else 1                     // unknown: return 1 byte
+
+fn tensor_num_elements(info: TensorInfo) -> Int =
+  list.fold(info.dims, 1, (acc, d) => acc * d)
+
+fn extract_f32_tensor(file: GGUFFile, info: TensorInfo) -> List[Float] = {
+  let start = file.data_offset + info.offset
+  let count = tensor_num_elements(info)
+  list.range(0, count) |> list.map((i) => r_f32(file.raw, start + i * 4))
+}
+
+fn extract_f32_matrix(file: GGUFFile, info: TensorInfo) -> Matrix = {
+  let values = extract_f32_tensor(file, info)
+  if list.len(info.dims) == 2 then {
+    let rows = list.get(info.dims, 0) |> option.unwrap_or(1)
+    let cols = list.get(info.dims, 1) |> option.unwrap_or(list.len(values))
+    let row_lists = list.range(0, rows) |> list.map((r) =>
+      list.slice(values, r * cols, (r + 1) * cols)
+    )
+    matrix.from_lists(row_lists)
+  } else {
+    // 1D: single-row matrix
+    matrix.from_lists([values])
+  }
+}
+
+// ── F16 → F32 conversion ──
+
+fn f16_to_f32(raw: Int) -> Float = {
+  let sign = int.band(int.bshr(raw, 15), 1)
+  let exponent = int.band(int.bshr(raw, 10), 31)
+  let mantissa = int.band(raw, 1023)
+  if exponent == 0 then {
+    // Subnormal
+    let val = int.to_float(mantissa) / 1024.0 * math.fpow(2.0, -14.0)
+    if sign == 1 then 0.0 - val else val
+  } else if exponent == 31 then {
+    // Inf/NaN → approximate as large float
+    if sign == 1 then -99999.0 else 99999.0
+  } else {
+    let val = (1.0 + int.to_float(mantissa) / 1024.0) * math.fpow(2.0, int.to_float(exponent) - 15.0)
+    if sign == 1 then 0.0 - val else val
+  }
+}
+
+fn extract_f16_tensor(file: GGUFFile, info: TensorInfo) -> List[Float] = {
+  let start = file.data_offset + info.offset
+  let count = tensor_num_elements(info)
+  list.range(0, count) |> list.map((i) => {
+    let raw = r_u8(file.raw, start + i * 2) + r_u8(file.raw, start + i * 2 + 1) * 256
+    f16_to_f32(raw)
+  })
+}
+
+// ── Lookup helpers ──
+
+fn find_tensor(file: GGUFFile, name: String) -> Option[TensorInfo] =
+  list.find(file.tensors, (t) => t.name == name)
+
+fn get_metadata_string(file: GGUFFile, key: String) -> Option[String] =
+  list.find(file.metadata.entries, (e) => e.0 == key)
+    |> option.flat_map((e) => match e.1 {
+      ValString(s) => some(s)
+      _ => none
+    })
+
+fn get_metadata_int(file: GGUFFile, key: String) -> Option[Int] =
+  list.find(file.metadata.entries, (e) => e.0 == key)
+    |> option.flat_map((e) => match e.1 {
+      ValInt(n) => some(n)
+      _ => none
+    })
+
+// ── Tests ──
+
+fn approx(a: Float, b: Float) -> Bool =
+  float.abs(a - b) < 0.01
+
+test "r_u32 little endian" {
+  let b = bytes.from_list([0x47, 0x47, 0x55, 0x46])
+  assert_eq(r_u32(b, 0), 1179993927)  // "GGUF" magic
+}
+
+test "r_string" {
+  let b = bytes.from_list([5, 0, 0, 0, 0, 0, 0, 0, 104, 101, 108, 108, 111])
+  let (s, next) = r_string(b, 0)
+  assert_eq(s, "hello")
+  assert_eq(next, 13)
+}
+
+test "f16_to_f32 zero" {
+  assert(approx(f16_to_f32(0), 0.0))
+}
+
+test "f16_to_f32 one" {
+  // F16 encoding of 1.0: sign=0, exp=15, mantissa=0 → 0b0_01111_0000000000 = 0x3C00
+  assert(approx(f16_to_f32(0x3C00), 1.0))
+}
+
+test "f16_to_f32 negative one" {
+  // F16 encoding of -1.0: sign=1, exp=15, mantissa=0 → 0b1_01111_0000000000 = 0xBC00
+  assert(approx(f16_to_f32(0xBC00), -1.0))
+}
+
+test "f16_to_f32 half" {
+  // F16 encoding of 0.5: sign=0, exp=14, mantissa=0 → 0b0_01110_0000000000 = 0x3800
+  assert(approx(f16_to_f32(0x3800), 0.5))
+}
+
+test "align_to" {
+  assert_eq(align_to(100, 32), 128)
+  assert_eq(align_to(128, 32), 128)
+  assert_eq(align_to(0, 32), 0)
+}
+
+test "tensor_num_elements" {
+  let info = TensorInfo { name: "test", dims: [3, 4], dtype: 0, offset: 0 }
+  assert_eq(tensor_num_elements(info), 12)
+}
+
+test "parse minimal gguf header" {
+  // Build a minimal GGUF v3 header: magic + version + 0 tensors + 0 metadata
+  let data = bytes.from_list([
+    0x47, 0x47, 0x55, 0x46,  // "GGUF"
+    3, 0, 0, 0,               // version 3
+    0, 0, 0, 0, 0, 0, 0, 0,  // tensor_count = 0
+    0, 0, 0, 0, 0, 0, 0, 0,  // metadata_count = 0
+  ])
+  match parse_header(data) {
+    ok(result) => {
+      let (header, pos) = result
+      assert_eq(header.version, 3)
+      assert_eq(header.tensor_count, 0)
+      assert_eq(header.metadata_count, 0)
+      assert_eq(pos, 24)
+    }
+    err(e) => { println("error: " + e); assert(false) }
+  }
+}
