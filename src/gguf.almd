@@ -131,16 +131,13 @@ fn parse_metadata_entries(data: Bytes, pos: Int, count: Int, acc: List[(String, 
 
 // ── Tensor info parsing ──
 
-fn read_dims(data: Bytes, start: Int, n: Int, acc: List[Int]) -> List[Int] =
-  if n <= 0 then acc
-  else read_dims(data, start + 8, n - 1, acc + [r_u64(data, start)])
-
 fn parse_tensor_infos(data: Bytes, pos: Int, count: Int, acc: List[TensorInfo]) -> (List[TensorInfo], Int) =
   if count <= 0 then (acc, pos)
   else {
     let (name, after_name) = r_string(data, pos)
     let n_dims = r_u32(data, after_name)
-    let dims = read_dims(data, after_name + 4, n_dims, [])
+    let dims = list.range(0, n_dims)
+      |> list.map((i) => r_u64(data, after_name + 4 + i * 8))
     let after_dims = after_name + 4 + n_dims * 8
     let dtype = r_u32(data, after_dims)
     let offset = r_u64(data, after_dims + 4)
