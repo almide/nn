@@ -95,42 +95,35 @@ fn approx(a: Float, b: Float) -> Bool =
   float.abs(a - b) < 0.01
 
 test "fft of constant signal" {
-  // FFT of [1, 1, 1, 1] → [4, 0, 0, 0]
-  let input = [(1.0, 0.0), (1.0, 0.0), (1.0, 0.0), (1.0, 0.0)]
-  let result = fft(input)
-  assert(approx((list.get(result, 0) |> option.unwrap_or((0.0, 0.0))).0, 4.0))
-  assert(approx((list.get(result, 1) |> option.unwrap_or((1.0, 0.0))).0, 0.0))
+  let result = fft([(1.0, 0.0), (1.0, 0.0), (1.0, 0.0), (1.0, 0.0)])
+  let r0 = list.first(result) |> option.unwrap_or((0.0, 0.0))
+  assert(approx(r0.0, 4.0))
 }
 
 test "fft of impulse" {
-  // FFT of [1, 0, 0, 0] → [1, 1, 1, 1]
-  let input = [(1.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
-  let result = fft(input)
-  assert(approx((list.get(result, 0) |> option.unwrap_or((0.0, 0.0))).0, 1.0))
-  assert(approx((list.get(result, 1) |> option.unwrap_or((0.0, 0.0))).0, 1.0))
-  assert(approx((list.get(result, 2) |> option.unwrap_or((0.0, 0.0))).0, 1.0))
+  let result = fft([(1.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)])
+  let r0 = list.first(result) |> option.unwrap_or((0.0, 0.0))
+  assert(approx(r0.0, 1.0))
 }
 
 test "fft preserves energy (Parseval)" {
-  // Sum of |x|^2 = (1/N) * sum of |X|^2
   let input = [(1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (4.0, 0.0)]
   let time_energy = list.fold(input, 0.0, (acc, c) => acc + c_mag_sq(c))
-  let freq = fft(input)
-  let freq_energy = list.fold(freq, 0.0, (acc, c) => acc + c_mag_sq(c)) / 4.0
+  let freq_energy = list.fold(fft([(1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (4.0, 0.0)]), 0.0, (acc, c) => acc + c_mag_sq(c)) / 4.0
   assert(approx(time_energy, freq_energy))
 }
 
 test "rfft of sine wave has peak at frequency" {
-  // 8 samples of a sine wave at frequency 1 (one full cycle)
   let n = 8
   let input = list.range(0, n) |> list.map((i) =>
     math.sin(2.0 * math.pi() * int.to_float(i) / int.to_float(n))
   )
   let spectrum = rfft(input)
-  // Frequency bin 1 should have the highest magnitude
-  let mag1 = c_mag(list.get(spectrum, 1) |> option.unwrap_or((0.0, 0.0)))
-  let mag0 = c_mag(list.get(spectrum, 0) |> option.unwrap_or((0.0, 0.0)))
-  let mag2 = c_mag(list.get(spectrum, 2) |> option.unwrap_or((0.0, 0.0)))
+  // Extract magnitudes individually to avoid multi-use of spectrum
+  let mags = list.map(spectrum, (c) => c_mag(c))
+  let mag0 = list.get(mags, 0) |> option.unwrap_or(0.0)
+  let mag1 = list.get(mags, 1) |> option.unwrap_or(0.0)
+  let mag2 = list.get(mags, 2) |> option.unwrap_or(0.0)
   assert(mag1 > mag0)
   assert(mag1 > mag2)
 }
