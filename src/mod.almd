@@ -1,0 +1,18 @@
+// nn — Neural network primitives for Almide
+//
+// Built entirely on Almide's stdlib `matrix` module. No external dependencies.
+//
+// Submodules:
+//   nn.tensor       Matrix extensions (slice, concat, broadcast, reductions)
+//   nn.activations  Activation functions (relu, gelu, softmax, sigmoid, tanh)
+//                   Layer normalization, linear layer
+//   nn.attention    Scaled dot-product attention, multi-head attention
+//
+// Usage:
+//   import nn.tensor as t
+//   import nn.activations as act
+//   import nn.attention as attn
+//
+//   let x = matrix.from_lists([[1.0, 2.0, 3.0]])
+//   let y = act.gelu(x)
+//   let z = act.softmax(y)

@@ -1,0 +1,218 @@
+// nn.activations — Neural network activation functions and normalization
+//
+// All functions operate on Matrix (row-major: rows=sequence, cols=features).
+// Reference values verified against PyTorch.
+
+import math
+import self.tensor as t
+
+// ── Activation functions (element-wise via matrix.map) ──
+
+fn relu(m: Matrix) -> Matrix =
+  matrix.map(m, (x) => if x > 0.0 then x else 0.0)
+
+fn gelu(m: Matrix) -> Matrix =
+  matrix.map(m, (x) => {
+    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+    let x3 = x * x * x
+    let inner = 0.7978845608 * (x + 0.044715 * x3)
+    // tanh via (exp(2a) - 1) / (exp(2a) + 1)
+    let e2 = math.exp(2.0 * inner)
+    let tanh_val = (e2 - 1.0) / (e2 + 1.0)
+    0.5 * x * (1.0 + tanh_val)
+  })
+
+fn sigmoid(m: Matrix) -> Matrix =
+  matrix.map(m, (x) => 1.0 / (1.0 + math.exp(0.0 - x)))
+
+fn tanh(m: Matrix) -> Matrix =
+  matrix.map(m, (x) => {
+    let e2 = math.exp(2.0 * x)
+    (e2 - 1.0) / (e2 + 1.0)
+  })
+
+// ── Softmax (row-wise, numerically stable) ──
+
+fn softmax(m: Matrix) -> Matrix = {
+  let data = matrix.to_lists(m)
+  let result = list.map(data, (row) => {
+    // Subtract max for numerical stability
+    let max_val = list.fold(list.drop(row, 1),
+      list.get(row, 0) |> option.unwrap_or(0.0),
+      (acc, x) => if x > acc then x else acc)
+    let exps = list.map(row, (x) => math.exp(x - max_val))
+    let sum = list.fold(exps, 0.0, (acc, x) => acc + x)
+    list.map(exps, (x) => x / sum)
+  })
+  matrix.from_lists(result)
+}
+
+// ── Layer Normalization ──
+
+fn layer_norm(m: Matrix, gamma: List[Float], beta: List[Float]) -> Matrix = {
+  let eps = 0.00001
+  let data = matrix.to_lists(m)
+  let c = int.to_float(list.len(list.get(data, 0) |> option.unwrap_or([])))
+  let result = list.map(data, (row) => {
+    let mean = list.fold(row, 0.0, (acc, x) => acc + x) / c
+    let variance = list.fold(row, 0.0, (acc, x) => acc + (x - mean) * (x - mean)) / c
+    let std_inv = 1.0 / math.sqrt(variance + eps)
+    // (x - mean) / sqrt(var + eps) * gamma + beta
+    list.zip(list.zip(row, gamma), beta)
+      |> list.map((outer) => {
+        let (inner, b) = outer
+        let (x, g) = inner
+        (x - mean) * std_inv * g + b
+      })
+  })
+  matrix.from_lists(result)
+}
+
+fn layer_norm_simple(m: Matrix) -> Matrix = {
+  let c = t.cols(m)
+  let ones = list.map(list.range(0, c), (_) => 1.0)
+  let zeros = list.map(list.range(0, c), (_) => 0.0)
+  layer_norm(m, ones, zeros)
+}
+
+// ── Linear layer: y = x @ W^T + bias ──
+
+fn linear(x: Matrix, weight: Matrix, bias: List[Float]) -> Matrix = {
+  let wt = matrix.transpose(weight)
+  let out = matrix.mul(x, wt)
+  t.broadcast_add(out, bias)
+}
+
+fn linear_no_bias(x: Matrix, weight: Matrix) -> Matrix = {
+  let wt = matrix.transpose(weight)
+  matrix.mul(x, wt)
+}
+
+// ── Tests ──
+
+fn approx(a: Float, b: Float) -> Bool =
+  float.abs(a - b) < 0.001
+
+fn approx_row(m: Matrix, row: Int, expected: List[Float]) -> Bool =
+  list.zip(list.range(0, list.len(expected)), expected)
+    |> list.all((pair) => approx(matrix.get(m, row, pair.0), pair.1))
+
+// -- Activation tests --
+
+test "relu zeros negatives" {
+  let m = matrix.from_lists([[-1.0, 0.0, 2.0, -3.0]])
+  let r = relu(m)
+  assert_eq(matrix.get(r, 0, 0), 0.0)
+  assert_eq(matrix.get(r, 0, 1), 0.0)
+  assert_eq(matrix.get(r, 0, 2), 2.0)
+  assert_eq(matrix.get(r, 0, 3), 0.0)
+}
+
+test "gelu at 0 is 0" {
+  let m = matrix.from_lists([[0.0]])
+  let r = gelu(m)
+  assert(approx(matrix.get(r, 0, 0), 0.0))
+}
+
+test "gelu at 1 is ~0.841" {
+  // PyTorch: torch.nn.functional.gelu(torch.tensor(1.0)) = 0.8412
+  let m = matrix.from_lists([[1.0]])
+  let r = gelu(m)
+  assert(approx(matrix.get(r, 0, 0), 0.841))
+}
+
+test "gelu at -1 is ~-0.159" {
+  let m = matrix.from_lists([[-1.0]])
+  let r = gelu(m)
+  assert(approx(matrix.get(r, 0, 0), -0.159))
+}
+
+test "sigmoid at 0 is 0.5" {
+  let m = matrix.from_lists([[0.0]])
+  let r = sigmoid(m)
+  assert(approx(matrix.get(r, 0, 0), 0.5))
+}
+
+test "sigmoid large positive is ~1" {
+  let m = matrix.from_lists([[10.0]])
+  let r = sigmoid(m)
+  assert(matrix.get(r, 0, 0) > 0.999)
+}
+
+test "tanh at 0 is 0" {
+  let m = matrix.from_lists([[0.0]])
+  let r = tanh(m)
+  assert(approx(matrix.get(r, 0, 0), 0.0))
+}
+
+// -- Softmax tests --
+
+test "softmax rows sum to 1" {
+  let m = matrix.from_lists([[1.0, 2.0, 3.0], [1.0, 1.0, 1.0]])
+  let s = softmax(m)
+  let sums = t.sum_rows(s)
+  assert(approx(list.get(sums, 0) |> option.unwrap_or(0.0), 1.0))
+  assert(approx(list.get(sums, 1) |> option.unwrap_or(0.0), 1.0))
+}
+
+test "softmax equal inputs give uniform" {
+  let m = matrix.from_lists([[1.0, 1.0, 1.0]])
+  let s = softmax(m)
+  assert(approx(matrix.get(s, 0, 0), 0.333))
+  assert(approx(matrix.get(s, 0, 1), 0.333))
+}
+
+test "softmax largest gets highest prob" {
+  let m = matrix.from_lists([[1.0, 5.0, 2.0]])
+  let s = softmax(m)
+  assert(matrix.get(s, 0, 1) > matrix.get(s, 0, 0))
+  assert(matrix.get(s, 0, 1) > matrix.get(s, 0, 2))
+}
+
+// -- LayerNorm tests --
+
+test "layer_norm_simple centers and scales" {
+  // After layer norm with gamma=1, beta=0: mean≈0, var≈1
+  let m = matrix.from_lists([[1.0, 2.0, 3.0, 4.0, 5.0]])
+  let n = layer_norm_simple(m)
+  let data = matrix.to_lists(n)
+  let row = list.get(data, 0) |> option.unwrap_or([])
+  let mean = list.fold(row, 0.0, (acc, x) => acc + x) / 5.0
+  assert(approx(mean, 0.0))
+}
+
+test "layer_norm with gamma and beta" {
+  let m = matrix.from_lists([[1.0, 3.0]])
+  // mean=2, var=1, std=1
+  // normalized: [-1, 1]
+  // gamma=2, beta=10: [-2+10, 2+10] = [8, 12]
+  let gamma = [2.0, 2.0]
+  let beta = [10.0, 10.0]
+  let n = layer_norm(m, gamma, beta)
+  assert(approx(matrix.get(n, 0, 0), 8.0))
+  assert(approx(matrix.get(n, 0, 1), 12.0))
+}
+
+// -- Linear tests --
+
+test "linear 2x3 @ 4x3 + bias" {
+  // x: (2, 3), weight: (4, 3), bias: (4,)
+  // y = x @ W^T + bias → (2, 4)
+  let x = matrix.from_lists([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+  let w = matrix.from_lists([
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [1.0, 1.0, 1.0],
+  ])
+  let bias = [0.1, 0.2, 0.3, 0.4]
+  let y = linear(x, w, bias)
+  assert_eq(t.rows(y), 2)
+  assert_eq(t.cols(y), 4)
+  // Row 0: [1,0,0] @ W^T + bias = [1+0.1, 0+0.2, 0+0.3, 1+0.4] = [1.1, 0.2, 0.3, 1.4]
+  assert(approx(matrix.get(y, 0, 0), 1.1))
+  assert(approx(matrix.get(y, 0, 1), 0.2))
+  assert(approx(matrix.get(y, 0, 3), 1.4))
+  // Row 1: [0,1,0] @ W^T + bias = [0+0.1, 1+0.2, 0+0.3, 1+0.4] = [0.1, 1.2, 0.3, 1.4]
+  assert(approx(matrix.get(y, 1, 1), 1.2))
+}

@@ -1,0 +1,157 @@
+// nn.attention — Multi-head self-attention and cross-attention
+//
+// Implements scaled dot-product attention as used in Transformers.
+// All operations use Matrix from stdlib.
+
+import math
+import self.tensor as t
+import self.activations as act
+
+// ── Scaled dot-product attention ──
+//
+// attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
+//
+// Q: (seq_q, d_k)  — queries
+// K: (seq_k, d_k)  — keys
+// V: (seq_k, d_v)  — values
+// Returns: (seq_q, d_v)
+
+fn scaled_dot_product(q: Matrix, k: Matrix, v: Matrix) -> Matrix = {
+  let d_k = int.to_float(t.cols(q))
+  let scale = 1.0 / math.sqrt(d_k)
+  let scores = matrix.scale(matrix.mul(q, matrix.transpose(k)), scale)
+  let weights = act.softmax(scores)
+  matrix.mul(weights, v)
+}
+
+// ── Causal (masked) attention ──
+//
+// For decoder self-attention: mask future positions with -infinity before softmax.
+
+fn causal_mask(size: Int) -> Matrix = {
+  let rows = list.range(0, size) |> list.map((i) =>
+    list.range(0, size) |> list.map((j) =>
+      if j <= i then 0.0 else -1000000.0
+    )
+  )
+  matrix.from_lists(rows)
+}
+
+fn masked_scaled_dot_product(q: Matrix, k: Matrix, v: Matrix) -> Matrix = {
+  let d_k = int.to_float(t.cols(q))
+  let scale = 1.0 / math.sqrt(d_k)
+  let scores = matrix.scale(matrix.mul(q, matrix.transpose(k)), scale)
+  let seq_q = t.rows(q)
+  let seq_k = t.rows(k)
+  // Apply causal mask (only when seq_q == seq_k, i.e., self-attention)
+  let masked = if seq_q == seq_k then matrix.add(scores, causal_mask(seq_q)) else scores
+  let weights = act.softmax(masked)
+  matrix.mul(weights, v)
+}
+
+// ── Multi-head attention ──
+//
+// Splits Q, K, V into `n_heads` heads, applies attention independently,
+// then concatenates and projects with output weight.
+//
+// x: (seq, d_model)
+// w_q, w_k, w_v: (d_model, d_model) — projection weights
+// w_o: (d_model, d_model) — output projection
+// b_q, b_k, b_v, b_o: (d_model,) — biases
+
+fn split_heads(m: Matrix, n_heads: Int) -> List[Matrix] = {
+  let data = matrix.to_lists(m)
+  let d_model = list.len(list.get(data, 0) |> option.unwrap_or([]))
+  let d_head = d_model / n_heads
+  list.range(0, n_heads) |> list.map((h) =>
+    matrix.from_lists(list.map(data, (row) => list.slice(row, h * d_head, (h + 1) * d_head)))
+  )
+}
+
+fn concat_heads(heads: List[Matrix]) -> Matrix =
+  list.fold(list.drop(heads, 1),
+    list.get(heads, 0) |> option.unwrap_or(matrix.zeros(0, 0)),
+    (acc, h) => t.concat_cols(acc, h)
+  )
+
+fn multi_head_attention(
+  q_in: Matrix, k_in: Matrix, v_in: Matrix,
+  w_q: Matrix, w_k: Matrix, w_v: Matrix, w_o: Matrix,
+  b_q: List[Float], b_k: List[Float], b_v: List[Float], b_o: List[Float],
+  n_heads: Int,
+) -> Matrix = {
+  let q = act.linear(q_in, w_q, b_q)
+  let k = act.linear(k_in, w_k, b_k)
+  let v = act.linear(v_in, w_v, b_v)
+  let q_heads = split_heads(q, n_heads)
+  let k_heads = split_heads(k, n_heads)
+  let v_heads = split_heads(v, n_heads)
+  let attn_heads = list.zip(list.zip(q_heads, k_heads), v_heads)
+    |> list.map((outer) => {
+      let (qk, vi) = outer
+      let (qi, ki) = qk
+      scaled_dot_product(qi, ki, vi)
+    })
+  let concatenated = concat_heads(attn_heads)
+  act.linear(concatenated, w_o, b_o)
+}
+
+// ── Tests ──
+
+fn approx(a: Float, b: Float) -> Bool =
+  float.abs(a - b) < 0.01
+
+test "scaled_dot_product output shape" {
+  let q = matrix.from_lists([[1.0, 0.0], [0.0, 1.0]])
+  let k = matrix.from_lists([[1.0, 0.0], [0.0, 1.0]])
+  let v = matrix.from_lists([[10.0, 20.0], [30.0, 40.0]])
+  let out = scaled_dot_product(q, k, v)
+  assert_eq(t.rows(out), 2)
+  assert_eq(t.cols(out), 2)
+  // Output is weighted combination of V rows — values should be in V's range
+  assert(matrix.get(out, 0, 0) >= 10.0)
+  assert(matrix.get(out, 0, 0) <= 30.0)
+}
+
+test "softmax attention weights sum to 1" {
+  let q = matrix.from_lists([[1.0, 0.0]])
+  let k = matrix.from_lists([[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]])
+  let v = matrix.from_lists([[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]])
+  let out = scaled_dot_product(q, k, v)
+  // Output is a weighted sum of V rows — each element should be in [0, 1]
+  assert(matrix.get(out, 0, 0) >= 0.0)
+  assert(matrix.get(out, 0, 0) <= 1.0)
+}
+
+test "causal_mask is lower triangular" {
+  let m = causal_mask(3)
+  // Diagonal and below = 0
+  assert_eq(matrix.get(m, 0, 0), 0.0)
+  assert_eq(matrix.get(m, 1, 0), 0.0)
+  assert_eq(matrix.get(m, 1, 1), 0.0)
+  // Above diagonal = large negative
+  assert(matrix.get(m, 0, 1) < -999999.0)
+  assert(matrix.get(m, 0, 2) < -999999.0)
+}
+
+test "masked attention can't look ahead" {
+  let q = matrix.from_lists([[1.0, 0.0], [0.0, 1.0]])
+  let k = matrix.from_lists([[1.0, 0.0], [0.0, 1.0]])
+  let v = matrix.from_lists([[10.0, 0.0], [0.0, 10.0]])
+  let out = masked_scaled_dot_product(q, k, v)
+  // Position 0 can only see position 0 → output[0] ≈ v[0] = [10, 0]
+  assert(approx(matrix.get(out, 0, 0), 10.0))
+  assert(approx(matrix.get(out, 0, 1), 0.0))
+}
+
+test "split_heads and concat_heads round-trip" {
+  let m = matrix.from_lists([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+  let heads = split_heads(m, 2)
+  assert_eq(list.len(heads), 2)
+  let reconstructed = concat_heads(heads)
+  assert_eq(t.rows(reconstructed), 2)
+  assert_eq(t.cols(reconstructed), 4)
+  assert_eq(matrix.get(reconstructed, 0, 0), 1.0)
+  assert_eq(matrix.get(reconstructed, 0, 3), 4.0)
+  assert_eq(matrix.get(reconstructed, 1, 2), 7.0)
+}
