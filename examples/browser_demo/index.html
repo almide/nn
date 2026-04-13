@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Almide WASM Whisper — Browser Demo</title>
+<style>
+  body { font: 14px/1.5 -apple-system, system-ui, sans-serif; max-width: 720px; margin: 2em auto; padding: 0 1em; color: #222; }
+  h1 { font-size: 1.4em; }
+  fieldset { border: 1px solid #ccc; padding: 1em; margin: 1em 0; }
+  label { display: block; margin: 0.4em 0; }
+  input[type=number] { width: 5em; }
+  button { padding: 0.6em 1em; font-size: 1em; }
+  button:disabled { opacity: 0.5; }
+  pre { background: #f4f4f4; padding: 1em; white-space: pre-wrap; word-break: break-word; }
+  .result { font-size: 1.2em; padding: 1em; background: #efe; border-left: 4px solid #4a4; }
+  .status { color: #666; font-style: italic; }
+  .error { color: #c33; }
+</style>
+</head>
+<body>
+<h1>Almide WASM Whisper — Browser Demo</h1>
+
+<p>
+Run OpenAI Whisper inference compiled to WebAssembly from
+<a href="https://github.com/almide/almide">Almide</a>. Pure Almide
+implementation — no JS ML framework, no native bindings.
+</p>
+
+<fieldset>
+  <legend>Inputs</legend>
+  <label>WASM module <code>(whisper_wasm_entry.wasm)</code>:
+    <input id="wasm" type="file" accept=".wasm" />
+  </label>
+  <label>Whisper model <code>(ggml-tiny.bin, 74 MB)</code>:
+    <input id="model" type="file" accept=".bin" />
+  </label>
+  <label>Pre-computed mel <code>(*.mel.bin, f64 LE, frames × 80)</code>:
+    <input id="mel" type="file" accept=".bin" />
+  </label>
+  <label>Max new tokens:
+    <input id="maxnew" type="number" value="30" min="1" max="200" />
+  </label>
+  <button id="run" disabled>Transcribe</button>
+</fieldset>
+
+<div id="status" class="status">Select files to enable Transcribe.</div>
+<div id="result"></div>
+
+<details>
+  <summary>Logs</summary>
+  <pre id="log"></pre>
+</details>
+
+<script type="module">
+import { makeWasi } from './wasi_shim.js';
+
+const $ = (id) => document.getElementById(id);
+const log = (msg) => { $('log').textContent += msg + '\n'; };
+const status = (msg, cls = 'status') => { $('status').className = cls; $('status').textContent = msg; };
+
+let wasmBuf = null, modelBuf = null, melBuf = null;
+
+function checkReady() {
+  const ok = wasmBuf && modelBuf && melBuf;
+  $('run').disabled = !ok;
+  if (ok) status('Ready. Click Transcribe.');
+}
+
+async function readFile(file) {
+  return new Uint8Array(await file.arrayBuffer());
+}
+
+$('wasm').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  status(`Loading WASM ${f.name}...`);
+  wasmBuf = await readFile(f);
+  log(`WASM loaded: ${wasmBuf.length} bytes`);
+  checkReady();
+});
+
+$('model').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  status(`Loading model ${f.name} (${(f.size / 1024 / 1024).toFixed(1)} MB)...`);
+  modelBuf = await readFile(f);
+  log(`Model loaded: ${(modelBuf.length / 1024 / 1024).toFixed(1)} MB`);
+  checkReady();
+});
+
+$('mel').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  status(`Loading mel ${f.name}...`);
+  melBuf = await readFile(f);
+  const frames = melBuf.length / 8 / 80;
+  log(`Mel loaded: ${melBuf.length} bytes (= ${frames} frames × 80 mels)`);
+  checkReady();
+});
+
+$('run').addEventListener('click', async () => {
+  $('run').disabled = true;
+  $('result').innerHTML = '';
+  try {
+    status('Instantiating WASM...');
+    const wasi = makeWasi({
+      stdout: (s) => log('[stdout] ' + s),
+      stderr: (s) => log('[stderr] ' + s),
+    });
+    const t0 = performance.now();
+    const { instance } = await WebAssembly.instantiate(wasmBuf, wasi.imports);
+    wasi.setMemory(instance.exports.memory);
+    if (instance.exports._initialize) instance.exports._initialize();
+    log(`Instantiated in ${(performance.now() - t0).toFixed(1)} ms`);
+
+    const { memory, __alloc, transcribe } = instance.exports;
+
+    const writeBytes = (buf) => {
+      const ptr = (__alloc(4 + buf.length) >>> 0);
+      const view = new DataView(memory.buffer);
+      view.setInt32(ptr, buf.length, true);
+      new Uint8Array(memory.buffer).set(buf, ptr + 4);
+      return ptr;
+    };
+    const readString = (ptr) => {
+      const view = new DataView(memory.buffer);
+      const len = view.getInt32(ptr, true);
+      return new TextDecoder().decode(new Uint8Array(memory.buffer, ptr + 4, len));
+    };
+    const unwrapResultString = (rawPtr) => {
+      const ptr = rawPtr >>> 0;
+      const view = new DataView(memory.buffer);
+      const tag = view.getInt32(ptr, true);
+      const payload = view.getInt32(ptr + 4, true) >>> 0;
+      if (tag !== 0) throw new Error('Almide returned Err: ' + readString(payload));
+      return readString(payload);
+    };
+
+    status('Writing model + mel to WASM memory...');
+    const t1 = performance.now();
+    const modelPtr = writeBytes(modelBuf);
+    const melPtr = writeBytes(melBuf);
+    log(`Memory ready in ${(performance.now() - t1).toFixed(1)} ms`);
+
+    const melFrames = melBuf.length / 8 / 80;
+    const maxNew = parseInt($('maxnew').value, 10);
+    status(`Transcribing (${melFrames} frames, max ${maxNew} tokens)... this takes a while.`);
+    log(`Calling transcribe(model, mel, frames=${melFrames}, max=${maxNew})`);
+
+    const t2 = performance.now();
+    // Yield to repaint so the status shows.
+    await new Promise((r) => setTimeout(r, 50));
+    const resultPtr = transcribe(modelPtr, melPtr, BigInt(melFrames), BigInt(maxNew));
+    const elapsed = performance.now() - t2;
+    const text = unwrapResultString(resultPtr);
+
+    log(`transcribe returned in ${(elapsed / 1000).toFixed(1)} s`);
+    status(`Done in ${(elapsed / 1000).toFixed(1)} s.`);
+    $('result').innerHTML = `<div class="result">${text}</div>`;
+  } catch (err) {
+    status('Error: ' + err.message, 'error');
+    log('ERROR: ' + (err.stack || err));
+  } finally {
+    $('run').disabled = false;
+  }
+});
+</script>
+</body>
+</html>
