@@ -36,4 +36,19 @@ effect fn main() -> () = {
     let dims_str = t.dims |> list.map((d) => int.to_string(d)) |> list.join("x")
     println("  " + t.name + ": [" + dims_str + "] ftype=" + int.to_string(t.ftype) + " size=" + int.to_string(t.data_size))
   }
+
+  // Verify we can actually decode tensor values by pulling the first few
+  // floats of a small F32 tensor (a layer norm bias — 384 elements).
+  println("=== First real weight values ===")
+  match gw.find_tensor(model.tensors, "encoder.blocks.0.attn_ln.weight") {
+    some(t) => {
+      let values = gw.tensor_to_floats(model, t)
+      println("  encoder.blocks.0.attn_ln.weight first 5 values:")
+      for i in [0, 1, 2, 3, 4] {
+        let v = list.get(values, i) |> option.unwrap_or(-999.0)
+        println("    [" + int.to_string(i) + "] = " + float.to_string(v))
+      }
+    },
+    none => println("  tensor not found"),
+  }
 }

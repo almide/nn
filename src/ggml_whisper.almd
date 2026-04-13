@@ -1,4 +1,5 @@
 import fs
+import math
 
 // nn.ggml_whisper — Parser for whisper.cpp GGML model files
 //
@@ -189,6 +190,85 @@ fn parse_tensors_loop(data: Bytes, pos: Int, total: Int, acc: List[TensorMeta]) 
     let (meta, next) = parse_tensor_meta(data, pos, total)
     parse_tensors_loop(data, next, total, acc + [meta])
   }
+
+// ── Tensor data extraction ──
+//
+// Decode the raw bytes at a tensor's data_offset into a List[Float]. Handles
+// the two float types whisper.cpp ships for unquantised tensors:
+//   - ftype=0: f32 little-endian
+//   - ftype=1: f16 IEEE-754 half precision little-endian
+// Quantised types (ftype >= 2) are not yet supported.
+
+// Decode IEEE-754 single-precision from its 32-bit pattern.
+//   sign [31]  exponent [30:23]  mantissa [22:0]
+fn f32_bits_to_float(bits: Int) -> Float = {
+  let sign = bits / 2147483648
+  let exp_m = bits - sign * 2147483648
+  let exp = exp_m / 8388608
+  let mantissa = exp_m - exp * 8388608
+  let sign_f = if sign == 1 then -1.0 else 1.0
+  if exp == 0 then
+    // Subnormal or zero: value = sign * mantissa * 2^-149
+    sign_f * int.to_float(mantissa) * 1.401298464324817e-45
+  else if exp == 255 then
+    if mantissa == 0 then (if sign == 1 then -3.4028235e38 else 3.4028235e38) else 0.0
+  else {
+    // Normal: (1 + mantissa/2^23) * 2^(exp-127) * sign
+    let m = 1.0 + int.to_float(mantissa) / 8388608.0
+    let e = exp - 127
+    sign_f * m * math.fpow(2.0, int.to_float(e))
+  }
+}
+
+fn read_f32_le(data: Bytes, pos: Int) -> Float = {
+  let b0 = bytes.read_u8(data, pos)
+  let b1 = bytes.read_u8(data, pos + 1)
+  let b2 = bytes.read_u8(data, pos + 2)
+  let b3 = bytes.read_u8(data, pos + 3)
+  let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+  f32_bits_to_float(bits)
+}
+
+// F16 → F32 using IEEE-754 half-precision layout.
+//   sign [15]  exponent [14:10]  mantissa [9:0]
+fn f16_to_f32(bits: Int) -> Float = {
+  let sign = bits / 32768
+  let exp_m = bits - sign * 32768   // lower 15 bits
+  let exp = exp_m / 1024            // bits [14:10]
+  let mantissa = exp_m - exp * 1024 // bits [9:0]
+  let sign_f = if sign == 1 then -1.0 else 1.0
+  if exp == 0 then
+    // Subnormal or zero: value = sign * mantissa * 2^-24
+    sign_f * int.to_float(mantissa) * 5.960464477539063e-8  // 2^-24
+  else if exp == 31 then
+    // Inf / NaN — degrade to a large finite number for simplicity
+    if mantissa == 0 then (if sign == 1 then -3.4028235e38 else 3.4028235e38) else 0.0
+  else {
+    // Normal: (1 + mantissa/1024) * 2^(exp-15) * sign
+    let m = 1.0 + int.to_float(mantissa) / 1024.0
+    let e = exp - 15
+    sign_f * m * math.fpow(2.0, int.to_float(e))
+  }
+}
+
+fn read_f16_le(data: Bytes, pos: Int) -> Float = {
+  let b0 = bytes.read_u8(data, pos)
+  let b1 = bytes.read_u8(data, pos + 1)
+  f16_to_f32(b0 + b1 * 256)
+}
+
+fn tensor_to_floats(model: Model, tensor: TensorMeta) -> List[Float] = {
+  let elem_count = list.fold(tensor.dims, 1, (acc, d) => acc * d)
+  match tensor.ftype {
+    0 => list.map(list.range(0, elem_count), (i) => read_f32_le(model.data, tensor.data_offset + i * 4)),
+    1 => list.map(list.range(0, elem_count), (i) => read_f16_le(model.data, tensor.data_offset + i * 2)),
+    _ => []  // unsupported type
+  }
+}
+
+// Find a tensor by exact name match.
+fn find_tensor(tensors: List[TensorMeta], name: String) -> Option[TensorMeta] =
+  list.find(tensors, (t) => t.name == name)
 
 // ── Top-level parser ──
 
