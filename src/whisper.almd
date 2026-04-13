@@ -171,7 +171,21 @@ test "encode_audio preserves (time, d_model) shape" {
   assert(matrix.rows(encoded) > 0, "encoder output should have some frames")
 }
 
-// Note: decode_tokens / transcribe WASM tests gated on a compiler fix.
-// The Rust-target tests (above) cover the end-to-end logic; each individual
-// sub-pipeline (mel, attention, transformer, generate, tokenizer) passes
-// WASM validation on its own.
+test "decode_tokens stops at eot" {
+  let config = test_config()
+  let weights = zero_weights(config, 3, 1, 1)
+  let encoder_out = matrix.from_lists([[0.0, 0.0, 0.0, 0.0]])
+  let ids = decode_tokens(encoder_out, weights, config, 5)
+  assert_eq(list.len(ids), 2)
+  assert_eq(list.get(ids, 0) |> option.unwrap_or(-1), config.sot_id)
+  assert_eq(list.get(ids, 1) |> option.unwrap_or(-1), config.eot_id)
+}
+
+test "transcribe runs end-to-end" {
+  let config = test_config()
+  let weights = zero_weights(config, 3, 1, 1)
+  let samples = list.map(list.range(0, 256), (i) => int.to_float(i) * 0.01)
+  let vocab = map.from_list([("<eot>", 0), ("<sot>", 1), ("hello", 2)])
+  let text = transcribe(samples, weights, config, vocab, 5)
+  assert_eq(text, "<sot><eot>")
+}

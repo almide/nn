@@ -94,19 +94,22 @@ fn encode(text: String, vocab: Vocab, merges: Merges) -> List[Int] = {
 // Decode a List[Int] → String by looking up each id in the reverse vocab.
 // Unknown ids (vocab miss) are skipped.
 
+// Reverse lookup: find the token string whose id matches `target`.
+// Returns "" if not found. Extracted as a top-level function so it
+// doesn't depend on a captured `pairs` list (which turns into a lifted
+// closure whose nested fold closure had signature-mismatch issues
+// in some multi-module WASM builds).
+fn lookup_token(pairs: List[(String, Int)], target: Int) -> String =
+  list.fold(pairs, "", (acc, pair) =>
+    if pair.1 == target then pair.0 else acc
+  )
+
 fn decode(ids: List[Int], vocab: Vocab) -> String = {
   // Linear scan of `vocab` entries for each id. For very large vocabs a
   // pre-built reverse map would be faster, but this is simple and avoids
   // a second dict allocation per call.
   let pairs = map.entries(vocab)
-  let lookup = (tid: Int) => {
-    let hit = list.fold(pairs, "", (acc, pair) => {
-      let (tok, id) = pair
-      if id == tid then tok else acc
-    })
-    hit
-  }
-  ids |> list.map(lookup) |> list.join("")
+  ids |> list.map((tid) => lookup_token(pairs, tid)) |> list.join("")
 }
 
 // ── Tests ──
