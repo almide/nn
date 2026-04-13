@@ -1,0 +1,39 @@
+// Inspect the whisper-tiny GGML file: print hparams, vocab stats, tensor list.
+
+import self.ggml_whisper as gw
+
+effect fn main() -> () = {
+  let path = "/tmp/whisper_demo/ggml-tiny.bin"
+  let model = gw.load(path)!
+
+  println("=== Hparams ===")
+  println("  n_vocab:       " + int.to_string(model.hparams.n_vocab))
+  println("  n_audio_ctx:   " + int.to_string(model.hparams.n_audio_ctx))
+  println("  n_audio_state: " + int.to_string(model.hparams.n_audio_state))
+  println("  n_audio_head:  " + int.to_string(model.hparams.n_audio_head))
+  println("  n_audio_layer: " + int.to_string(model.hparams.n_audio_layer))
+  println("  n_text_ctx:    " + int.to_string(model.hparams.n_text_ctx))
+  println("  n_text_state:  " + int.to_string(model.hparams.n_text_state))
+  println("  n_text_head:   " + int.to_string(model.hparams.n_text_head))
+  println("  n_text_layer:  " + int.to_string(model.hparams.n_text_layer))
+  println("  n_mels:        " + int.to_string(model.hparams.n_mels))
+  println("  ftype:         " + int.to_string(model.hparams.ftype))
+
+  println("=== Vocab ===")
+  println("  total tokens: " + int.to_string(model.n_vocab))
+  // Sample the first few tokens (lazy lookup, no full materialisation)
+  for i in [0, 1, 2, 50, 100] {
+    match gw.vocab_at(model.data, model.vocab_offset, i) {
+      some(tok) => println("  vocab[" + int.to_string(i) + "] = " + tok),
+      none => println("  vocab[" + int.to_string(i) + "] = <missing>"),
+    }
+  }
+
+  println("=== Tensors ===")
+  println("  total tensors: " + int.to_string(list.len(model.tensors)))
+  let first_five = list.take(model.tensors, 5)
+  for t in first_five {
+    let dims_str = t.dims |> list.map((d) => int.to_string(d)) |> list.join("x")
+    println("  " + t.name + ": [" + dims_str + "] ftype=" + int.to_string(t.ftype) + " size=" + int.to_string(t.data_size))
+  }
+}

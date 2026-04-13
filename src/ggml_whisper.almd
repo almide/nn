@@ -1,0 +1,246 @@
+import fs
+
+// nn.ggml_whisper — Parser for whisper.cpp GGML model files
+//
+// Reads the binary format used by `ggml-tiny.en.bin` (and its siblings) to
+// extract hyperparameters, vocabulary, and tensor metadata.
+//
+// Layout (little-endian):
+//   [4]     magic "ggml" (0x67676d6c)
+//   [4*11]  hparams: n_vocab, n_audio_ctx, n_audio_state, n_audio_head,
+//           n_audio_layer, n_text_ctx, n_text_state, n_text_head,
+//           n_text_layer, n_mels, ftype
+//   [4*2]   mel filter header: n_mel, n_fft_filter
+//   [4*N]   mel filter data (n_mel * n_fft_filter f32)
+//   [4]     n_vocab_file
+//   for each token:
+//     [4]   len
+//     [len] token bytes
+//   for each tensor (until EOF):
+//     [4]   n_dims
+//     [4]   name_len
+//     [4]   ftype (0=f32, 1=f16, 2=q4_0, ...)
+//     [4*n_dims] dims (each i32)
+//     [name_len] name bytes
+//     (aligned to 32-byte boundary)
+//     [size] data
+
+type Hparams = {
+  n_vocab: Int,
+  n_audio_ctx: Int,
+  n_audio_state: Int,
+  n_audio_head: Int,
+  n_audio_layer: Int,
+  n_text_ctx: Int,
+  n_text_state: Int,
+  n_text_head: Int,
+  n_text_layer: Int,
+  n_mels: Int,
+  ftype: Int,
+}
+
+type TensorMeta = {
+  name: String,
+  dims: List[Int],
+  ftype: Int,        // 0=f32, 1=f16, 2..=quantized
+  data_offset: Int,  // byte offset in file
+  data_size: Int,    // bytes
+}
+
+type Model = {
+  hparams: Hparams,
+  vocab_offset: Int,      // file offset where vocab starts (skip for now)
+  vocab_end: Int,         // file offset where vocab ends (tensors start here)
+  n_vocab: Int,           // count of tokens in the vocab section
+  tensors: List[TensorMeta],
+  data: Bytes,            // full file bytes (tokens can be read lazily)
+}
+
+// ── Low-level bytes readers (little-endian) ──
+//
+// The stdlib `bytes` module only ships big-endian readers today, so we
+// assemble LE values from individual bytes here.
+
+fn read_u32(data: Bytes, pos: Int) -> Int = {
+  let b0 = bytes.read_u8(data, pos)
+  let b1 = bytes.read_u8(data, pos + 1)
+  let b2 = bytes.read_u8(data, pos + 2)
+  let b3 = bytes.read_u8(data, pos + 3)
+  b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+
+fn read_i32(data: Bytes, pos: Int) -> Int = {
+  let u = read_u32(data, pos)
+  // Sign-extend 32-bit to 64-bit
+  if u >= 2147483648 then u - 4294967296 else u
+}
+
+fn read_bytes_string(data: Bytes, pos: Int, len: Int) -> String = {
+  // Concatenate bytes as ASCII characters. GGML vocab tokens are valid UTF-8
+  // byte sequences; for tokens that happen to be multi-byte, this still
+  // produces the right byte sequence because String in Almide is a raw
+  // byte buffer in the WASM layout.
+  let chars = list.map(list.range(0, len), (i) => {
+    let b = bytes.read_u8(data, pos + i)
+    string.from_codepoint(b)
+  })
+  list.join(chars, "")
+}
+
+// ── Parse stages ──
+
+fn parse_hparams(data: Bytes, pos: Int) -> (Hparams, Int) = {
+  let h = {
+    n_vocab: read_i32(data, pos),
+    n_audio_ctx: read_i32(data, pos + 4),
+    n_audio_state: read_i32(data, pos + 8),
+    n_audio_head: read_i32(data, pos + 12),
+    n_audio_layer: read_i32(data, pos + 16),
+    n_text_ctx: read_i32(data, pos + 20),
+    n_text_state: read_i32(data, pos + 24),
+    n_text_head: read_i32(data, pos + 28),
+    n_text_layer: read_i32(data, pos + 32),
+    n_mels: read_i32(data, pos + 36),
+    ftype: read_i32(data, pos + 40),
+  }
+  (h, pos + 44)
+}
+
+// Skip the mel filter bank — we compute our own mels from audio at runtime.
+fn skip_mel_filters(data: Bytes, pos: Int) -> Int = {
+  let n_mel = read_i32(data, pos)
+  let n_fft = read_i32(data, pos + 4)
+  pos + 8 + n_mel * n_fft * 4
+}
+
+// Skip past the vocab section without materialising every token string.
+// Returns (n_vocab, section_start, section_end).
+fn skip_vocab(data: Bytes, pos: Int) -> (Int, Int, Int) = {
+  let n = read_i32(data, pos)
+  let start = pos + 4
+  let end = skip_vocab_loop(data, start, n, 0)
+  (n, start, end)
+}
+
+fn skip_vocab_loop(data: Bytes, pos: Int, total: Int, i: Int) -> Int =
+  if i >= total then pos
+  else {
+    let len = read_i32(data, pos)
+    skip_vocab_loop(data, pos + 4 + len, total, i + 1)
+  }
+
+// Read one vocab entry by index. Does a linear scan from the section start,
+// so repeated calls are O(n); for bulk decoding, callers should materialise
+// only the token ids they need (in Whisper this is a handful per generation).
+fn vocab_at(data: Bytes, vocab_start: Int, idx: Int) -> Option[String] =
+  vocab_at_loop(data, vocab_start, idx, 0)
+
+fn vocab_at_loop(data: Bytes, pos: Int, target: Int, i: Int) -> Option[String] = {
+  let len = read_i32(data, pos)
+  if i == target then some(read_bytes_string(data, pos + 4, len))
+  else vocab_at_loop(data, pos + 4 + len, target, i + 1)
+}
+
+// Align `pos` up to the next 32-byte boundary. whisper.cpp pads tensor data
+// to match the GGML memory alignment requirement.
+fn align32(pos: Int) -> Int =
+  (pos + 31) / 32 * 32
+
+// Byte size of one element for a given ftype code.
+fn ftype_size(ftype: Int) -> Int =
+  match ftype {
+    0 => 4,  // f32
+    1 => 2,  // f16
+    _ => 4,  // unknown: assume f32 (real quantised types use block sizes)
+  }
+
+fn parse_tensor_meta(data: Bytes, pos: Int, total: Int) -> (TensorMeta, Int) = {
+  let n_dims = read_i32(data, pos)
+  let name_len = read_i32(data, pos + 4)
+  let ftype = read_i32(data, pos + 8)
+  let dims_start = pos + 12
+  let dims = list.map(list.range(0, n_dims), (i) => read_i32(data, dims_start + i * 4))
+  let name_start = dims_start + n_dims * 4
+  let name = read_bytes_string(data, name_start, name_len)
+  // Element count = product of dims
+  let elem_count = list.fold(dims, 1, (acc, d) => acc * d)
+  let data_size = elem_count * ftype_size(ftype)
+  // Whisper.cpp GGML pads tensor DATA to 32-byte boundary — not the name.
+  let data_offset = name_start + name_len
+  // Skip padding if any (whisper.cpp tiny doesn't strictly align — the data
+  // follows the name directly, but some versions align).
+  let next_pos = data_offset + data_size
+  let meta = {
+    name: name,
+    dims: dims,
+    ftype: ftype,
+    data_offset: data_offset,
+    data_size: data_size,
+  }
+  (meta, next_pos)
+}
+
+fn parse_tensors(data: Bytes, pos: Int, total: Int) -> List[TensorMeta] =
+  parse_tensors_loop(data, pos, total, [])
+
+fn parse_tensors_loop(data: Bytes, pos: Int, total: Int, acc: List[TensorMeta]) -> List[TensorMeta] =
+  if pos >= total then acc
+  else {
+    let (meta, next) = parse_tensor_meta(data, pos, total)
+    parse_tensors_loop(data, next, total, acc + [meta])
+  }
+
+// ── Top-level parser ──
+
+fn parse(data: Bytes) -> Result[Model, String] = {
+  let total = bytes.len(data)
+  if total < 48 then err("file too short to be a GGML whisper model")
+  else {
+    let magic = read_u32(data, 0)
+    if magic != 0x67676d6c then err("not a GGML file (magic mismatch)")
+    else {
+      let (hparams, pos1) = parse_hparams(data, 4)
+      let pos2 = skip_mel_filters(data, pos1)
+      let (n_vocab, vocab_start, vocab_end) = skip_vocab(data, pos2)
+      let tensors = parse_tensors(data, vocab_end, total)
+      ok({
+        hparams: hparams,
+        vocab_offset: vocab_start,
+        vocab_end: vocab_end,
+        n_vocab: n_vocab,
+        tensors: tensors,
+        data: data,
+      })
+    }
+  }
+}
+
+// ── Effect-fn load helper ──
+
+effect fn load(path: String) -> Result[Model, String] =
+  match fs.read_bytes(path) {
+    ok(byte_list) => parse(bytes.from_list(byte_list)),
+    err(e) => err("failed to read " + path + ": " + e),
+  }
+
+// ── Tests ──
+
+test "read_u32 assembles little-endian bytes" {
+  // 0x01 0x02 0x03 0x04 → LE = 0x04030201 = 67305985
+  let data = bytes.from_list([0x01, 0x02, 0x03, 0x04])
+  assert_eq(read_u32(data, 0), 67305985)
+}
+
+test "read_i32 sign-extends negative values" {
+  // 0xFF 0xFF 0xFF 0xFF → LE = 0xFFFFFFFF = -1 as i32
+  let data = bytes.from_list([0xFF, 0xFF, 0xFF, 0xFF])
+  assert_eq(read_i32(data, 0), -1)
+}
+
+test "align32 rounds up to 32-byte boundary" {
+  assert_eq(align32(0), 0)
+  assert_eq(align32(1), 32)
+  assert_eq(align32(31), 32)
+  assert_eq(align32(32), 32)
+  assert_eq(align32(33), 64)
+}
