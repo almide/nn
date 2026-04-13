@@ -1,0 +1,18 @@
+// Cross-attention test: q has different shape from k/v.
+// Tests if our multi_head_attention handles asymmetric shapes correctly.
+
+effect fn main() -> () = {
+  // 2 query positions, 4 key/value positions, 1 head, d=2
+  let q = matrix.from_lists([[1.0, 0.0], [0.0, 1.0]])
+  let k = matrix.from_lists([[1.0, 0.0], [0.5, 0.5], [0.0, 1.0], [1.0, 1.0]])
+  let v = matrix.from_lists([[10.0, 0.0], [0.0, 10.0], [5.0, 5.0], [1.0, 1.0]])
+
+  let out = matrix.multi_head_attention(q, k, v, 1)
+  println("cross-attn shape: " + int.to_string(matrix.rows(out)) + "x" + int.to_string(matrix.cols(out)))
+  println("pos0: " + float.to_string(matrix.get(out, 0, 0)) + ", " + float.to_string(matrix.get(out, 0, 1)))
+  println("pos1: " + float.to_string(matrix.get(out, 1, 0)) + ", " + float.to_string(matrix.get(out, 1, 1)))
+
+  // Expected: q[0]=(1,0) aligns with k[0]=(1,0), so pos0 output ≈ v[0] = (10, 0)
+  //           q[1]=(0,1) aligns with k[2]=(0,1), so pos1 output ≈ v[2] = (5, 5)
+  println("Expected pos0 ≈ v[0] = (10, 0), pos1 ≈ v[2] = (5, 5)")
+}

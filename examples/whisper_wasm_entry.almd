@@ -1,0 +1,94 @@
+// WASM entry point for Whisper transcription.
+//
+// Exposed function: `transcribe(model_bytes, audio_bytes, max_new)` — takes
+// the raw GGML file bytes and a raw 16kHz mono f32 WAV file, returns the
+// transcribed text. Designed to be callable from JS host via WASM memory:
+// the host writes the two Bytes blobs into WASM memory, invokes this
+// function, reads back the returned String pointer.
+
+import self.ggml_whisper as gw
+import self.whisper_loader as wl
+import self.whisper as w
+import self.generate as gen
+import self.transformer as tf
+import self.activations as act
+
+fn whisper_tiny_en_config() -> w.WhisperConfig = {
+  n_mels: 80,
+  d_model: 384,
+  n_heads: 6,
+  n_audio_ctx: 1500,
+  n_text_ctx: 448,
+  sot_id: 50257,
+  eot_id: 50256,
+  sample_rate: 16000,
+  n_fft: 400,
+  hop_length: 160,
+}
+
+fn token_name(tid: Int) -> String =
+  match tid {
+    50256 => "<|endoftext|>",
+    50257 => "<|sot|>",
+    50357 => "<|translate|>",
+    50358 => "<|transcribe|>",
+    50360 => "<|startofprev|>",
+    50361 => "<|nospeech|>",
+    50362 => "<|notimestamps|>",
+    _ => "",
+  }
+
+fn decode_content(ids: List[Int], vocab: List[String]) -> String =
+  ids
+    |> list.filter((tid) => tid < 50256)
+    |> list.map((tid) => list.get(vocab, tid) |> option.unwrap_or(""))
+    |> list.join("")
+
+// Main entry — JS host computes mel spectrogram (Almide-side mel exhausts
+// WASM heap due to per-frame List allocations) and passes it as a flat
+// f64 LE byte buffer of shape (mel_frames, 80).
+effect fn transcribe(model_bytes: Bytes, mel_bytes: Bytes, mel_frames: Int, max_new: Int) -> String = {
+  // 1. Parse GGML model
+  let model = gw.parse(model_bytes)!
+  let vocab = gw.vocab_all(model)
+  let config = whisper_tiny_en_config()
+  let weights = wl.load_weights(model, config, 4, 4, 51864)
+
+  // 2. Reconstruct mel matrix from JS-supplied bytes
+  let mel_mat = matrix.from_bytes_f64_le(mel_bytes, 0, mel_frames, config.n_mels)
+
+  let conv1_w = wl.load_conv1_weight(model, config.d_model, config.n_mels)
+  let conv1_b = wl.load_conv1_bias(model, config.d_model)
+  let after_conv1 = matrix.gelu(matrix.conv1d(mel_mat, conv1_w, conv1_b, 3, 1, 1))
+
+  let conv2_w = wl.load_conv2_weight(model, config.d_model)
+  let conv2_b = wl.load_conv2_bias(model, config.d_model)
+  let after_conv2 = matrix.gelu(matrix.conv1d(after_conv1, conv2_w, conv2_b, 3, 2, 1))
+
+  let enc_pos = wl.load_encoder_pos_embed(model, config.d_model, config.n_audio_ctx)
+  let t_hidden = matrix.rows(after_conv2)
+  let pos_slice = matrix.slice_rows(enc_pos, 0, t_hidden)
+  let hidden_with_pos = matrix.add(after_conv2, pos_slice)
+
+  let encoded = tf.encode(hidden_with_pos, weights.encoder_layers, config.n_heads)
+  let encoder_out = act.layer_norm(encoded, weights.encoder_ln_gamma, weights.encoder_ln_beta)
+
+  // 5. Decode
+  let prefix = [50257, 50358, 50362]
+  let dec_pos = wl.load_decoder_pos_embed(model, config.d_model, config.n_text_ctx)
+  let suppress: List[Int] = []
+  let token_ids = gen.greedy_generate_with_pos(
+    prefix,
+    encoder_out,
+    weights.decoder_layers,
+    config.n_heads,
+    weights.token_embedding,
+    dec_pos,
+    weights.decoder_ln_gamma,
+    weights.decoder_ln_beta,
+    suppress,
+    config.eot_id,
+    max_new,
+  )
+  decode_content(token_ids, vocab)
+}

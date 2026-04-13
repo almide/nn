@@ -1,0 +1,104 @@
+// Real-weight single encoder-block forward pass benchmark.
+//
+// Loads encoder.blocks.0 from a real Whisper-tiny GGML model, assembles
+// a transformer.EncoderLayer, and times a forward pass on a (1500, 384)
+// synthetic hidden-state input. This is the same shape Whisper-tiny uses
+// after its audio frontend, so the measured time is directly comparable
+// to PyTorch/NumPy numbers for Whisper-tiny encoder.blocks.0.
+
+import self.ggml_whisper as gw
+import self.transformer as tf
+import env
+
+fn build_matrix(m: gw.Model, name: String, rows: Int, cols: Int) -> Matrix =
+  match gw.find_tensor(m.tensors, name) {
+    some(t) => match t.ftype {
+      0 => matrix.from_bytes_f32_le(m.data, t.data_offset, rows, cols),
+      1 => matrix.from_bytes_f16_le(m.data, t.data_offset, rows, cols),
+      _ => matrix.zeros(rows, cols),
+    },
+    none => matrix.zeros(rows, cols),
+  }
+
+fn build_vec(m: gw.Model, name: String, n: Int) -> List[Float] =
+  match gw.find_tensor(m.tensors, name) {
+    some(t) => match t.ftype {
+      0 => bytes.read_f32_le_array(m.data, t.data_offset, n),
+      1 => bytes.read_f16_le_array(m.data, t.data_offset, n),
+      _ => list.map(list.range(0, n), (_) => 0.0),
+    },
+    none => list.map(list.range(0, n), (_) => 0.0),
+  }
+
+fn build_lin(m: gw.Model, prefix: String, rows: Int, cols: Int) -> tf.LinearWeights = {
+  w: build_matrix(m, prefix + ".weight", rows, cols),
+  bias: build_vec(m, prefix + ".bias", rows),
+}
+
+fn build_ln(m: gw.Model, prefix: String, d: Int) -> tf.LayerNormParams = {
+  gamma: build_vec(m, prefix + ".weight", d),
+  beta: build_vec(m, prefix + ".bias", d),
+}
+
+fn build_encoder_layer0(m: gw.Model, d_model: Int, d_ff: Int) -> tf.EncoderLayer = {
+  attn: {
+    q: build_lin(m, "encoder.blocks.0.attn.query", d_model, d_model),
+    k: {
+      w: build_matrix(m, "encoder.blocks.0.attn.key.weight", d_model, d_model),
+      // K bias is traditionally omitted in Whisper; fill with zeros.
+      bias: list.map(list.range(0, d_model), (_) => 0.0),
+    },
+    v: build_lin(m, "encoder.blocks.0.attn.value", d_model, d_model),
+    out: build_lin(m, "encoder.blocks.0.attn.out", d_model, d_model),
+  },
+  ln1: build_ln(m, "encoder.blocks.0.attn_ln", d_model),
+  ln2: build_ln(m, "encoder.blocks.0.mlp_ln", d_model),
+  ffn1: build_lin(m, "encoder.blocks.0.mlp.0", d_ff, d_model),
+  ffn2: build_lin(m, "encoder.blocks.0.mlp.2", d_model, d_ff),
+}
+
+effect fn main() -> () = {
+  println("Loading ggml-tiny.bin ...")
+  let t_load0 = env.millis()
+  let model = gw.load("/tmp/whisper_demo/ggml-tiny.bin")!
+  let t_load1 = env.millis()
+  println("loaded in " + int.to_string(t_load1 - t_load0) + " ms, " + int.to_string(list.len(model.tensors)) + " tensors")
+
+  let d_model = 384
+  let n_heads = 6
+  let d_ff = 1536
+  let seq_len = 1500  // Whisper encoder fixed context
+
+  println("Building encoder.blocks.0 weights (d=" + int.to_string(d_model) + ", d_ff=" + int.to_string(d_ff) + ", heads=" + int.to_string(n_heads) + ") ...")
+  let t_build0 = env.millis()
+  let layer = build_encoder_layer0(model, d_model, d_ff)
+  let t_build1 = env.millis()
+  println("built in " + int.to_string(t_build1 - t_build0) + " ms")
+
+  // Synthetic input: (seq_len, d_model) with some structure so we can
+  // spot-check the first cell.
+  println("Building input (" + int.to_string(seq_len) + ", " + int.to_string(d_model) + ") ...")
+  let row = list.map(list.range(0, d_model), (i) => int.to_float(i) * 0.001)
+  let input_lists = list.map(list.range(0, seq_len), (_) => row)
+  let x = matrix.from_lists(input_lists)
+
+  // Warm-up pass
+  let warm = tf.encoder_block_r(x, layer, n_heads)
+  let (wr, wc) = matrix.shape(warm)
+  println("warm-up: output shape=(" + int.to_string(wr) + "," + int.to_string(wc) + "), first=" + float.to_string(matrix.get(warm, 0, 0)))
+
+  // Timed runs
+  let iters = 5
+  let t_fwd0 = env.millis()
+  var acc = 0.0
+  var i = 0
+  while i < iters {
+    let out = tf.encoder_block_r(x, layer, n_heads)
+    acc = acc + matrix.get(out, 0, 0)
+    i = i + 1
+  }
+  let t_fwd1 = env.millis()
+  let elapsed = t_fwd1 - t_fwd0
+  let per_run_ms = int.to_float(elapsed) / int.to_float(iters)
+  println("forward: " + int.to_string(iters) + " iters in " + int.to_string(elapsed) + " ms = " + float.to_string(per_run_ms) + " ms/run (acc=" + float.to_string(acc) + ")")
+}

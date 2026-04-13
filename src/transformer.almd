@@ -71,15 +71,10 @@ fn decoder_block(
   w_ffn1: Matrix, b_ffn1: List[Float],
   w_ffn2: Matrix, b_ffn2: List[Float],
 ) -> Matrix = {
-  // Causal self-attention (pre-LN)
+  // Causal self-attention. Required for stable long-range generation;
+  // without it the decoder hallucinates and loops on repeat phrases.
   let x_norm = act.layer_norm(x, ln1_gamma, ln1_beta)
-  // For causal self-attention we rely on the user's w_so producing proper masking internally;
-  // our attention module has masked_scaled_dot_product for the mechanism — but the MHA
-  // facade doesn't expose masking yet. We use non-causal MHA here and rely on training-time
-  // masking conventions (the caller is responsible for providing causally-ordered tokens).
-  //
-  // TODO: extend attn.multi_head_attention with a causal_mask parameter.
-  let self_out = attn.multi_head_attention(
+  let self_out = attn.masked_multi_head_attention(
     x_norm, x_norm, x_norm,
     w_sq, w_sk, w_sv, w_so,
     b_sq, b_sk, b_sv, b_so,
@@ -182,13 +177,10 @@ fn decode(
 // gathering rows from the embedding matrix. Out-of-range tokens are mapped
 // to the zero vector (graceful degradation — unknown tokens don't crash).
 
-fn embed(tokens: List[Int], embedding: Matrix) -> Matrix = {
-  let d_model = matrix.cols(embedding)
-  let rows = matrix.to_lists(embedding)
-  let vec_for = (tok: Int) =>
-    list.get(rows, tok) |> option.unwrap_or(list.map(list.range(0, d_model), (_) => 0.0))
-  matrix.from_lists(list.map(tokens, vec_for))
-}
+fn embed(tokens: List[Int], embedding: Matrix) -> Matrix =
+  // Native gather avoids the catastrophic O(vocab*d_model) `to_lists` that
+  // previously ran on every decoder step (160MB allocs for tiny.en).
+  matrix.gather_rows(embedding, tokens)
 
 // ── Tests ──
 

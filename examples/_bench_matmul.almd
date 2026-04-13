@@ -1,0 +1,45 @@
+// Matmul throughput benchmark. Whisper tiny attention/MLP blocks are
+// dominated by matrix multiplications at 384×384 and 384×1536. We want
+// numbers comparable to NumPy (BLAS-backed).
+//
+// We go through matrix.from_bytes_f32_le to simulate the real GGML load
+// path so the whole pipeline (bytes → matrix → matmul) is exercised.
+
+import env
+
+effect fn bench_matmul(label: String, rows_a: Int, cols_a: Int, cols_b: Int, iters: Int) -> () = {
+  // Synth data: all-0.001 matrices (matmul result predictable, data plausible).
+  let a = matrix.ones(rows_a, cols_a) |> (m) => matrix.scale(m, 0.001)
+  let b = matrix.ones(cols_a, cols_b) |> (m) => matrix.scale(m, 0.001)
+
+  // Warm up
+  let warm = matrix.mul(a, b)
+  let warm_v = matrix.get(warm, 0, 0)
+
+  let t0 = env.millis()
+  var i = 0
+  var acc = 0.0
+  while i < iters {
+    let r = matrix.mul(a, b)
+    // Touch every iteration's result so LLVM can't hoist the call.
+    acc = acc + matrix.get(r, 0, 0)
+    i = i + 1
+  }
+  let t1 = env.millis()
+  let elapsed = t1 - t0
+  let flops_per_mul = 2 * rows_a * cols_a * cols_b
+  let total_flops = iters * flops_per_mul
+  let gflops = int.to_float(total_flops) / (int.to_float(elapsed) / 1000.0) / 1000000000.0
+  println(label + ": " + int.to_string(iters) + "×" + int.to_string(rows_a) + "x" + int.to_string(cols_a) + "@" + int.to_string(cols_a) + "x" + int.to_string(cols_b) + " = " + int.to_string(elapsed) + "ms → " + float.to_string(gflops) + " GFLOPS (acc=" + float.to_string(acc) + ", warm=" + float.to_string(warm_v) + ")")
+}
+
+effect fn main() -> () = {
+  println("Almide matmul throughput (burn NdArray + BLAS)")
+  // Whisper tiny sizes
+  bench_matmul("attn.qkv   384x384 × 384x384", 384, 384, 384, 50)
+  bench_matmul("mlp.up     384x1536 × 1536x384 (transpose-ish)", 384, 1536, 384, 50)
+  bench_matmul("mlp.down   1536x384 × 384x1536", 1536, 384, 1536, 20)
+  // A "square" size to compare against NumPy benchmarks
+  bench_matmul("square     512x512", 512, 512, 512, 50)
+  bench_matmul("square     1024x1024", 1024, 1024, 1024, 10)
+}

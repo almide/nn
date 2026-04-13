@@ -26,13 +26,11 @@ fn argmax(logits: List[Float]) -> Int =
 // Whisper ties the output projection to the token embedding matrix, so the
 // same weights are used on the way in (embed) and on the way out (project).
 
-fn project(hidden_last: List[Float], embedding: Matrix) -> List[Float] = {
-  let rows = matrix.to_lists(embedding)
-  list.map(rows, (row) =>
-    list.zip(hidden_last, row)
-      |> list.fold(0.0, (acc, p) => acc + p.0 * p.1)
-  )
-}
+fn project(hidden_last: List[Float], embedding: Matrix) -> List[Float] =
+  // Compute logits[i] = embedding[i] · hidden_last using native row-dot.
+  // Avoids materialising the entire embedding as List[List[Float]].
+  list.map(list.range(0, matrix.rows(embedding)), (i) =>
+    matrix.row_dot(embedding, i, hidden_last))
 
 // ── One decoding step ──
 //
@@ -85,6 +83,80 @@ fn greedy_generate(
   max_new: Int,
 ) -> List[Int] =
   greedy_step(start_tokens, encoder_out, layers, n_heads, embedding, eos_id, max_new)
+
+// Argmax over logits with specified positions forcibly masked to -inf.
+// Used to suppress special / control tokens during content generation.
+fn argmax_suppress(logits: List[Float], suppress: List[Int]) -> Int = {
+  let masked = list.enumerate(logits) |> list.map((entry) => {
+    let (i, v) = entry
+    if list.contains(suppress, i) then -1.0e30 else v
+  })
+  argmax(masked)
+}
+
+// ── Positional-embedding-aware variant ──
+//
+// Whisper's decoder adds `decoder.positional_embedding[:seq_len]` to the
+// token embeddings before any attention layer. Without it the self-attention
+// has no sense of position and collapses to a degenerate distribution.
+// `pos_embed` should have shape (max_text_ctx, d_model).
+
+fn decode_step_pos(
+  tokens: List[Int],
+  encoder_out: Matrix,
+  layers: List[tf.DecoderLayer],
+  n_heads: Int,
+  embedding: Matrix,
+  pos_embed: Matrix,
+  final_ln_gamma: List[Float],
+  final_ln_beta: List[Float],
+  suppress: List[Int],
+) -> Int = {
+  let x_tok = tf.embed(tokens, embedding)
+  let pos_slice = matrix.slice_rows(pos_embed, 0, list.len(tokens))
+  let x = matrix.add(x_tok, pos_slice)
+  let hidden = tf.decode(x, encoder_out, layers, n_heads)
+  let hidden_ln = matrix.layer_norm_rows(hidden, final_ln_gamma, final_ln_beta, 0.00001)
+  let hidden_rows = matrix.to_lists(hidden_ln)
+  let last = list.get(hidden_rows, list.len(hidden_rows) - 1) |> option.unwrap_or([])
+  let logits = project(last, embedding)
+  argmax_suppress(logits, suppress)
+}
+
+fn greedy_step_pos(
+  tokens: List[Int],
+  encoder_out: Matrix,
+  layers: List[tf.DecoderLayer],
+  n_heads: Int,
+  embedding: Matrix,
+  pos_embed: Matrix,
+  final_ln_gamma: List[Float],
+  final_ln_beta: List[Float],
+  suppress: List[Int],
+  eos_id: Int,
+  remaining: Int,
+) -> List[Int] =
+  if remaining <= 0 then tokens
+  else {
+    let next = decode_step_pos(tokens, encoder_out, layers, n_heads, embedding, pos_embed, final_ln_gamma, final_ln_beta, suppress)
+    if next == eos_id then tokens + [next]
+    else greedy_step_pos(tokens + [next], encoder_out, layers, n_heads, embedding, pos_embed, final_ln_gamma, final_ln_beta, suppress, eos_id, remaining - 1)
+  }
+
+fn greedy_generate_with_pos(
+  start_tokens: List[Int],
+  encoder_out: Matrix,
+  layers: List[tf.DecoderLayer],
+  n_heads: Int,
+  embedding: Matrix,
+  pos_embed: Matrix,
+  final_ln_gamma: List[Float],
+  final_ln_beta: List[Float],
+  suppress: List[Int],
+  eos_id: Int,
+  max_new: Int,
+) -> List[Int] =
+  greedy_step_pos(start_tokens, encoder_out, layers, n_heads, embedding, pos_embed, final_ln_gamma, final_ln_beta, suppress, eos_id, max_new)
 
 // ── Tests ──
 

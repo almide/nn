@@ -1,0 +1,10 @@
+import self.ggml_whisper as gw
+
+effect fn main() -> () = {
+  let model = gw.load("/tmp/whisper_demo/ggml-tiny.bin")!
+  for t in model.tensors {
+    let dims = t.dims |> list.map((d) => int.to_string(d)) |> list.join("x")
+    println(t.name + " [" + dims + "] ftype=" + int.to_string(t.ftype))
+  }
+  println("total: " + int.to_string(list.len(model.tensors)))
+}

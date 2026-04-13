@@ -1,0 +1,6 @@
+import self.ggml_whisper as gw
+
+effect fn probe(data: Bytes) -> Int = {
+  let m = gw.parse(data)!
+  list.len(m.tensors)
+}

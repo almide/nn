@@ -1,0 +1,3 @@
+import self.ggml_whisper as gw
+
+effect fn probe() -> Int = 42

@@ -1,0 +1,180 @@
+// End-to-end Whisper transcription with real GGML weights.
+//
+// Pipeline:
+//   1. Load ggml-tiny.bin (~77MB)
+//   2. Load vocab (51864 tokens) for detokenization
+//   3. Build WhisperWeights from the 167 tensors
+//   4. Load a WAV, compute mel spectrogram
+//   5. Run encoder + greedy decoder
+//   6. Detokenize to text
+//
+// Caveats (honest):
+//   - conv1 is approximated by the middle kernel slice (no conv2, no
+//     positional embedding). Encoder output will be distorted, so the
+//     produced text is not expected to match the audio content yet.
+//   - This is primarily a "pipeline runs with real weights" demo.
+
+import self.ggml_whisper as gw
+import self.whisper_loader as wl
+import self.whisper as w
+import self.wav as wav
+import self.generate as gen
+import self.transformer as tf
+import self.activations as act
+import self.mel as mel_mod
+import env
+
+// Special-token labels for Whisper tiny.en (n_vocab=51864). Values taken
+// straight from whisper.cpp src/whisper.cpp so there is one source of truth.
+fn token_name(tid: Int) -> String =
+  match tid {
+    50256 => "<|endoftext|>",
+    50257 => "<|sot|>",
+    50357 => "<|translate|>",
+    50358 => "<|transcribe|>",
+    50360 => "<|startofprev|>",
+    50361 => "<|nospeech|>",
+    50362 => "<|notimestamps|>",
+    _ => "",
+  }
+
+fn decode_ids(ids: List[Int], vocab: List[String]) -> String = {
+  ids
+    |> list.map((tid) => {
+      let special = token_name(tid)
+      if special != "" then special
+      else list.get(vocab, tid) |> option.unwrap_or("<?" + int.to_string(tid) + "?>")
+    })
+    |> list.join("")
+}
+
+// Content-only: strip everything ≥ 50256 (eot + special / timestamp tokens).
+fn decode_content(ids: List[Int], vocab: List[String]) -> String = {
+  ids
+    |> list.filter((tid) => tid < 50256)
+    |> list.map((tid) => list.get(vocab, tid) |> option.unwrap_or(""))
+    |> list.join("")
+}
+
+fn whisper_tiny_en_config() -> w.WhisperConfig = {
+  n_mels: 80,
+  d_model: 384,
+  n_heads: 6,
+  n_audio_ctx: 1500,
+  n_text_ctx: 448,
+  // For the English-only tiny.en model (n_vocab=51864) the special token IDs
+  // are shifted by 1 vs multilingual. Multi-lang uses 50258/50257, .en uses
+  // 50257/50256.
+  sot_id: 50257,   // <|startoftranscript|>
+  eot_id: 50256,   // <|endoftext|>
+  sample_rate: 16000,
+  n_fft: 400,
+  hop_length: 160,
+}
+
+effect fn main() -> () = {
+  println("=== Whisper real-weight demo ===")
+  let t0 = env.millis()
+
+  // 1. Load model
+  let model = gw.load("/tmp/whisper_demo/ggml-tiny.bin")!
+  let t1 = env.millis()
+  println("loaded GGML model: " + int.to_string(list.len(model.tensors)) + " tensors in " + int.to_string(t1 - t0) + " ms")
+
+  // 2. Load vocab
+  let vocab = gw.vocab_all(model)
+  let t2 = env.millis()
+  println("loaded vocab: " + int.to_string(list.len(vocab)) + " tokens in " + int.to_string(t2 - t1) + " ms")
+  println("  token[50258]=\"" + (list.get(vocab, 50258) |> option.unwrap_or("")) + "\" (expected <|startoftranscript|>)")
+  println("  token[50257]=\"" + (list.get(vocab, 50257) |> option.unwrap_or("")) + "\" (expected <|endoftext|>)")
+
+  // 3. Build weights
+  let config = whisper_tiny_en_config()
+  let weights = wl.load_weights(model, config, 4, 4, 51864)
+  let t3 = env.millis()
+  println("built WhisperWeights in " + int.to_string(t3 - t2) + " ms")
+  println("  encoder layers: " + int.to_string(list.len(weights.encoder_layers)))
+  println("  decoder layers: " + int.to_string(list.len(weights.decoder_layers)))
+  println("  conv1_w: " + int.to_string(matrix.rows(weights.conv1_w)) + "x" + int.to_string(matrix.cols(weights.conv1_w)))
+  println("  token_embedding: " + int.to_string(matrix.rows(weights.token_embedding)) + "x" + int.to_string(matrix.cols(weights.token_embedding)))
+
+  // 4. Load audio
+  let audio = wav.load("/tmp/whisper_demo/hello.wav")!
+  let t4 = env.millis()
+  println("loaded audio: " + int.to_string(list.len(audio.samples)) + " samples in " + int.to_string(t4 - t3) + " ms")
+
+  // Whisper expects 30s of audio. Pad with zeros to 480 000 samples (30s @ 16kHz).
+  let target_samples = 30 * config.sample_rate
+  let current = list.len(audio.samples)
+  let padded_samples = if current >= target_samples then
+    list.slice(audio.samples, 0, target_samples)
+  else
+    audio.samples + list.map(list.range(0, target_samples - current), (_) => 0.0)
+  println("padded audio to " + int.to_string(list.len(padded_samples)) + " samples (30s)")
+
+  // 5-6. Proper Whisper encoder: conv1 → gelu → conv2 → gelu → +pos_embed
+  //                                → encoder blocks → final layer norm
+  //
+  // Use the mel filterbank shipped inside the GGML file (bit-exact match
+  // with whisper.cpp) instead of computing our own.
+  let mel_filters = wl.load_mel_filters(model)
+  println("mel filters: " + int.to_string(list.len(mel_filters)) + " x " + int.to_string(list.len(list.get(mel_filters, 0) |> option.unwrap_or([]))))
+  let mel_lists = mel_mod.mel_spectrogram_with_filters(padded_samples, mel_filters, config.n_fft, config.hop_length)
+  let mel_mat = matrix.from_lists(mel_lists)
+  let t5 = env.millis()
+  println("mel: " + int.to_string(matrix.rows(mel_mat)) + "x" + int.to_string(matrix.cols(mel_mat)) + " in " + int.to_string(t5 - t4) + " ms")
+
+  // conv1: (T, 80) → (T, 384), kernel=3 stride=1 padding=1
+  let conv1_w = wl.load_conv1_weight(model, config.d_model, config.n_mels)
+  let conv1_b = wl.load_conv1_bias(model, config.d_model)
+  let after_conv1 = matrix.gelu(matrix.conv1d(mel_mat, conv1_w, conv1_b, 3, 1, 1))
+  println("after conv1+gelu: " + int.to_string(matrix.rows(after_conv1)) + "x" + int.to_string(matrix.cols(after_conv1)))
+
+  // conv2: (T, 384) → (T/2, 384), kernel=3 stride=2 padding=1
+  let conv2_w = wl.load_conv2_weight(model, config.d_model)
+  let conv2_b = wl.load_conv2_bias(model, config.d_model)
+  let after_conv2 = matrix.gelu(matrix.conv1d(after_conv1, conv2_w, conv2_b, 3, 2, 1))
+  println("after conv2+gelu: " + int.to_string(matrix.rows(after_conv2)) + "x" + int.to_string(matrix.cols(after_conv2)))
+
+  // Add positional embedding (truncated to current time steps)
+  let enc_pos = wl.load_encoder_pos_embed(model, config.d_model, config.n_audio_ctx)
+  let t_hidden = matrix.rows(after_conv2)
+  let pos_slice = matrix.slice_rows(enc_pos, 0, t_hidden)
+  let hidden_with_pos = matrix.add(after_conv2, pos_slice)
+
+  // Run encoder blocks + final layer norm
+  let encoded = tf.encode(hidden_with_pos, weights.encoder_layers, config.n_heads)
+  let encoder_out = act.layer_norm(encoded, weights.encoder_ln_gamma, weights.encoder_ln_beta)
+  let t6 = env.millis()
+  println("encoder_out: " + int.to_string(matrix.rows(encoder_out)) + "x" + int.to_string(matrix.cols(encoder_out)) + " in " + int.to_string(t6 - t5) + " ms")
+
+  // Tiny.en prefix per whisper.cpp: [SOT, transcribe, notimestamps] with
+  // the .en-specific IDs (eot=50256, sot=50257, transcribe=50358, not=50362).
+  let prefix = [50257, 50358, 50362]
+  let dec_pos = wl.load_decoder_pos_embed(model, config.d_model, config.n_text_ctx)
+  // Suppress special / control tokens during content generation so the model
+  // doesn't emit <|startoflm|> or duplicate task tokens mid-utterance.
+  // All special IDs except <|endoftext|> (50257) and timestamp range.
+  let suppress: List[Int] = []
+  let token_ids = gen.greedy_generate_with_pos(
+    prefix,
+    encoder_out,
+    weights.decoder_layers,
+    config.n_heads,
+    weights.token_embedding,
+    dec_pos,
+    weights.decoder_ln_gamma,
+    weights.decoder_ln_beta,
+    suppress,
+    config.eot_id,
+    50,  // max_new — let it transcribe the full utterance
+  )
+  let t7 = env.millis()
+  println("generated " + int.to_string(list.len(token_ids)) + " tokens in " + int.to_string(t7 - t6) + " ms:")
+  println("  ids: " + (token_ids |> list.map(int.to_string) |> list.join(",")))
+
+  println("  raw:  \"" + decode_ids(token_ids, vocab) + "\"")
+  println("  text: \"" + decode_content(token_ids, vocab) + "\"")
+
+  println("=== done in " + int.to_string(t7 - t0) + " ms total ===")
+}

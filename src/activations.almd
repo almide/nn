@@ -12,15 +12,11 @@ fn relu(m: Matrix) -> Matrix =
   matrix.map(m, (x) => if x > 0.0 then x else 0.0)
 
 fn gelu(m: Matrix) -> Matrix =
-  matrix.map(m, (x) => {
-    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
-    let x3 = x * x * x
-    let inner = 0.7978845608 * (x + 0.044715 * x3)
-    // tanh via (exp(2a) - 1) / (exp(2a) + 1)
-    let e2 = math.exp(2.0 * inner)
-    let tanh_val = (e2 - 1.0) / (e2 + 1.0)
-    0.5 * x * (1.0 + tanh_val)
-  })
+  // Native stdlib implementation — runs inside the Matrix runtime
+  // (burn+BLAS for `almide run`, pure Vec<f64> otherwise). Previously
+  // this used matrix.map with a lambda, which forced per-element Rust
+  // closure calls and a list-of-list round-trip.
+  matrix.gelu(m)
 
 fn sigmoid(m: Matrix) -> Matrix =
   matrix.map(m, (x) => 1.0 / (1.0 + math.exp(0.0 - x)))
@@ -33,40 +29,13 @@ fn tanh(m: Matrix) -> Matrix =
 
 // ── Softmax (row-wise, numerically stable) ──
 
-fn softmax(m: Matrix) -> Matrix = {
-  let data = matrix.to_lists(m)
-  let result = list.map(data, (row) => {
-    // Subtract max for numerical stability
-    let max_val = list.fold(list.drop(row, 1),
-      list.get(row, 0) |> option.unwrap_or(0.0),
-      (acc, x) => if x > acc then x else acc)
-    let exps = list.map(row, (x) => math.exp(x - max_val))
-    let sum = list.fold(exps, 0.0, (acc, x) => acc + x)
-    list.map(exps, (x) => x / sum)
-  })
-  matrix.from_lists(result)
-}
+fn softmax(m: Matrix) -> Matrix =
+  matrix.softmax_rows(m)
 
 // ── Layer Normalization ──
 
-fn layer_norm(m: Matrix, gamma: List[Float], beta: List[Float]) -> Matrix = {
-  let eps = 0.00001
-  let data = matrix.to_lists(m)
-  let c = int.to_float(list.len(list.get(data, 0) |> option.unwrap_or([])))
-  let result = list.map(data, (row) => {
-    let mean = list.fold(row, 0.0, (acc, x) => acc + x) / c
-    let variance = list.fold(row, 0.0, (acc, x) => acc + (x - mean) * (x - mean)) / c
-    let std_inv = 1.0 / math.sqrt(variance + eps)
-    // (x - mean) / sqrt(var + eps) * gamma + beta
-    list.zip(list.zip(row, gamma), beta)
-      |> list.map((outer) => {
-        let (inner, b) = outer
-        let (x, g) = inner
-        (x - mean) * std_inv * g + b
-      })
-  })
-  matrix.from_lists(result)
-}
+fn layer_norm(m: Matrix, gamma: List[Float], beta: List[Float]) -> Matrix =
+  matrix.layer_norm_rows(m, gamma, beta, 0.00001)
 
 fn layer_norm_simple(m: Matrix) -> Matrix = {
   let c = t.cols(m)
@@ -77,16 +46,12 @@ fn layer_norm_simple(m: Matrix) -> Matrix = {
 
 // ── Linear layer: y = x @ W^T + bias ──
 
-fn linear(x: Matrix, weight: Matrix, bias: List[Float]) -> Matrix = {
-  let wt = matrix.transpose(weight)
-  let out = matrix.mul(x, wt)
-  t.broadcast_add(out, bias)
-}
+fn linear(x: Matrix, weight: Matrix, bias: List[Float]) -> Matrix =
+  // Fused native: transpose + matmul + broadcast add in one call.
+  matrix.linear_row(x, weight, bias)
 
-fn linear_no_bias(x: Matrix, weight: Matrix) -> Matrix = {
-  let wt = matrix.transpose(weight)
-  matrix.mul(x, wt)
-}
+fn linear_no_bias(x: Matrix, weight: Matrix) -> Matrix =
+  matrix.linear_row_no_bias(x, weight)
 
 // ── Tests ──
 

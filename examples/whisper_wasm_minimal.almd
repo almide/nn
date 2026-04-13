@@ -1,0 +1,7 @@
+// Minimal WASM entry: just parse model + vocab count.
+import self.ggml_whisper as gw
+
+effect fn transcribe(model_bytes: Bytes, audio_bytes: Bytes, max_new: Int) -> String = {
+  let m = gw.parse(model_bytes)!
+  int.to_string(list.len(m.tensors)) + " tensors, vocab=" + int.to_string(m.n_vocab)
+}

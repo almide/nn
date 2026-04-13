@@ -1,0 +1,180 @@
+// nn.whisper_loader — Build WhisperWeights from a parsed GGML model.
+//
+// Wires every named tensor in a Whisper-tiny GGML file (167 tensors) into
+// the records consumed by `whisper.transcribe`. GGML's tensor naming is
+// stable across OpenAI / whisper.cpp releases so the lookups below should
+// work for any `ggml-{tiny,base,small,medium,large}` so long as the
+// caller passes a matching config (n_layers, d_model, n_heads, d_ff).
+//
+// Simplifications:
+//   - conv1 / conv2: whisper.almd models mel→hidden as a single linear.
+//     We approximate by using the middle kernel slice of encoder.conv1
+//     (shape [3, n_mels, d_model]). conv2 and positional_embedding are
+//     ignored for now — this hurts transcription fidelity but lets the
+//     pipeline run end-to-end on real weights.
+//   - Key projections (attn.key) in Whisper have no bias; we fill zeros.
+
+import self.ggml_whisper as gw
+import self.transformer as tf
+import self.whisper as w
+
+// ── Low-level helpers ──
+
+fn tensor_matrix(m: gw.Model, name: String, rows: Int, cols: Int) -> Matrix =
+  match gw.find_tensor(m.tensors, name) {
+    some(t) => match t.ftype {
+      0 => matrix.from_bytes_f32_le(m.data, t.data_offset, rows, cols),
+      1 => matrix.from_bytes_f16_le(m.data, t.data_offset, rows, cols),
+      _ => matrix.zeros(rows, cols),
+    },
+    none => matrix.zeros(rows, cols),
+  }
+
+fn tensor_vec(m: gw.Model, name: String, n: Int) -> List[Float] =
+  match gw.find_tensor(m.tensors, name) {
+    some(t) => match t.ftype {
+      0 => bytes.read_f32_le_array(m.data, t.data_offset, n),
+      1 => bytes.read_f16_le_array(m.data, t.data_offset, n),
+      _ => list.map(list.range(0, n), (_) => 0.0),
+    },
+    none => list.map(list.range(0, n), (_) => 0.0),
+  }
+
+fn zero_vec(n: Int) -> List[Float] =
+  list.map(list.range(0, n), (_) => 0.0)
+
+// ── Per-layer loaders ──
+
+fn load_lin(m: gw.Model, prefix: String, rows: Int, cols: Int) -> tf.LinearWeights = {
+  w: tensor_matrix(m, prefix + ".weight", rows, cols),
+  bias: tensor_vec(m, prefix + ".bias", rows),
+}
+
+fn load_lin_no_bias(m: gw.Model, prefix: String, rows: Int, cols: Int) -> tf.LinearWeights = {
+  w: tensor_matrix(m, prefix + ".weight", rows, cols),
+  bias: zero_vec(rows),
+}
+
+fn load_ln(m: gw.Model, prefix: String, d: Int) -> tf.LayerNormParams = {
+  gamma: tensor_vec(m, prefix + ".weight", d),
+  beta: tensor_vec(m, prefix + ".bias", d),
+}
+
+fn load_attn(m: gw.Model, prefix: String, d: Int) -> tf.AttentionWeights = {
+  q: load_lin(m, prefix + ".query", d, d),
+  // key has no bias in Whisper
+  k: load_lin_no_bias(m, prefix + ".key", d, d),
+  v: load_lin(m, prefix + ".value", d, d),
+  out: load_lin(m, prefix + ".out", d, d),
+}
+
+fn load_encoder_layer(m: gw.Model, i: Int, d: Int, d_ff: Int) -> tf.EncoderLayer = {
+  let prefix = "encoder.blocks." + int.to_string(i)
+  {
+    attn: load_attn(m, prefix + ".attn", d),
+    ln1: load_ln(m, prefix + ".attn_ln", d),
+    ln2: load_ln(m, prefix + ".mlp_ln", d),
+    ffn1: load_lin(m, prefix + ".mlp.0", d_ff, d),
+    ffn2: load_lin(m, prefix + ".mlp.2", d, d_ff),
+  }
+}
+
+fn load_decoder_layer(m: gw.Model, i: Int, d: Int, d_ff: Int) -> tf.DecoderLayer = {
+  let prefix = "decoder.blocks." + int.to_string(i)
+  {
+    self_attn: load_attn(m, prefix + ".attn", d),
+    cross_attn: load_attn(m, prefix + ".cross_attn", d),
+    ln1: load_ln(m, prefix + ".attn_ln", d),
+    ln2: load_ln(m, prefix + ".cross_attn_ln", d),
+    ln3: load_ln(m, prefix + ".mlp_ln", d),
+    ffn1: load_lin(m, prefix + ".mlp.0", d_ff, d),
+    ffn2: load_lin(m, prefix + ".mlp.2", d, d_ff),
+  }
+}
+
+// ── Top-level loader ──
+
+fn load_weights(m: gw.Model, config: w.WhisperConfig, n_enc: Int, n_dec: Int, vocab_size: Int) -> w.WhisperWeights = {
+  let d = config.d_model
+  let d_ff = d * 4
+  // Whisper-tiny FFN width is 4 * d_model (384 → 1536). Correct for all tiers.
+
+  // conv1: GGML layout is [3, n_mels, d] stored as `k * n_mels * d + c * d + o`
+  // (innermost = out channel). For linear(mel, weight, bias) with
+  // mel: (time, n_mels) we need weight: (d, n_mels) so `mel @ weight^T`
+  // gives (time, d). The middle kernel slice, read row-major as
+  // (n_mels, d), is (in, out) — we'd need a transpose. Instead read it
+  // as (n_mels, d) and treat the 2nd dim as row: matrix.from_bytes gives
+  // rows=n_mels, cols=d. Then transpose to (d, n_mels).
+  let conv1_w = match gw.find_tensor(m.tensors, "encoder.conv1.weight") {
+    some(t) => {
+      let elem = match t.ftype { 1 => 2, _ => 4 }
+      let mid_offset = t.data_offset + config.n_mels * d * elem
+      let raw = match t.ftype {
+        0 => matrix.from_bytes_f32_le(m.data, mid_offset, config.n_mels, d),
+        1 => matrix.from_bytes_f16_le(m.data, mid_offset, config.n_mels, d),
+        _ => matrix.zeros(config.n_mels, d),
+      }
+      matrix.transpose(raw)  // (n_mels, d) → (d, n_mels)
+    },
+    none => matrix.zeros(d, config.n_mels),
+  }
+  let conv1_b = tensor_vec(m, "encoder.conv1.bias", d)
+
+  {
+    conv1_w: conv1_w,
+    conv1_b: conv1_b,
+    encoder_layers: list.map(list.range(0, n_enc), (i) => load_encoder_layer(m, i, d, d_ff)),
+    encoder_ln_gamma: tensor_vec(m, "encoder.ln_post.weight", d),
+    encoder_ln_beta: tensor_vec(m, "encoder.ln_post.bias", d),
+    token_embedding: tensor_matrix(m, "decoder.token_embedding.weight", vocab_size, d),
+    decoder_layers: list.map(list.range(0, n_dec), (i) => load_decoder_layer(m, i, d, d_ff)),
+    decoder_ln_gamma: tensor_vec(m, "decoder.ln.weight", d),
+    decoder_ln_beta: tensor_vec(m, "decoder.ln.bias", d),
+  }
+}
+
+// ── Positional embeddings ──
+//
+// GGML stores positional_embedding as [d_model, n_ctx] — innermost=d_model,
+// outermost=n_ctx. With matrix.from_bytes_f32_le(data, off, n_ctx, d_model)
+// we read n_ctx rows of d_model elements = (n_ctx, d_model). No transpose needed.
+
+fn load_encoder_pos_embed(m: gw.Model, d: Int, n_ctx: Int) -> Matrix =
+  tensor_matrix(m, "encoder.positional_embedding", n_ctx, d)
+
+fn load_decoder_pos_embed(m: gw.Model, d: Int, n_ctx: Int) -> Matrix =
+  tensor_matrix(m, "decoder.positional_embedding", n_ctx, d)
+
+// ── Conv weights ──
+//
+// GGML stores conv1.weight with ne=[3, n_mels, d] — innermost=3 (kernel),
+// middle=n_mels, outermost=d. Element (o, c, k) sits at data[o*n_mels*3 + c*3 + k].
+// That layout is exactly what `matrix.conv1d` expects for weight[o, c*kernel + k],
+// so we can read as a (d, n_mels*3) flat matrix directly.
+
+fn load_conv1_weight(m: gw.Model, d: Int, n_mels: Int) -> Matrix =
+  tensor_matrix(m, "encoder.conv1.weight", d, n_mels * 3)
+
+fn load_conv1_bias(m: gw.Model, d: Int) -> List[Float] =
+  tensor_vec(m, "encoder.conv1.bias", d)
+
+fn load_conv2_weight(m: gw.Model, d: Int) -> Matrix =
+  tensor_matrix(m, "encoder.conv2.weight", d, d * 3)
+
+fn load_conv2_bias(m: gw.Model, d: Int) -> List[Float] =
+  tensor_vec(m, "encoder.conv2.bias", d)
+
+// ── Mel filterbank shipped inside the GGML file ──
+//
+// whisper.cpp stores a (n_mel, n_fft_filter) f32 matrix right after hparams.
+// Using these filters (instead of computing them from HTK/Slaney formulas in
+// Almide) guarantees bit-exact compatibility with whisper.cpp's preprocessing.
+
+fn load_mel_filters(m: gw.Model) -> List[List[Float]] = {
+  let flat = bytes.read_f32_le_array(m.data, m.mel_filters_offset, m.mel_n_mel * m.mel_n_fft)
+  list.range(0, m.mel_n_mel) |> list.map((i) => {
+    let start = i * m.mel_n_fft
+    list.slice(flat, start, start + m.mel_n_fft)
+  })
+}

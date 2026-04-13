@@ -28,23 +28,14 @@ fn scaled_dot_product(q: Matrix, k: Matrix, v: Matrix) -> Matrix = {
 //
 // For decoder self-attention: mask future positions with -infinity before softmax.
 
-fn causal_mask(size: Int) -> Matrix = {
-  let rows = list.range(0, size) |> list.map((i) =>
-    list.range(0, size) |> list.map((j) =>
-      if j <= i then 0.0 else -1000000.0
-    )
-  )
-  matrix.from_lists(rows)
-}
-
 fn masked_scaled_dot_product(q: Matrix, k: Matrix, v: Matrix) -> Matrix = {
   let d_k = int.to_float(t.cols(q))
   let scale = 1.0 / math.sqrt(d_k)
   let scores = matrix.scale(matrix.mul(q, matrix.transpose(k)), scale)
   let seq_q = t.rows(q)
   let seq_k = t.rows(k)
-  // Apply causal mask (only when seq_q == seq_k, i.e., self-attention)
-  let masked = if seq_q == seq_k then matrix.add(scores, causal_mask(seq_q)) else scores
+  // Native causal mask — adds `-1e9` to upper triangle in one pass.
+  let masked = if seq_q == seq_k then matrix.causal_mask_add(scores, -1000000000.0) else scores
   let weights = act.softmax(masked)
   matrix.mul(weights, v)
 }
@@ -59,20 +50,11 @@ fn masked_scaled_dot_product(q: Matrix, k: Matrix, v: Matrix) -> Matrix = {
 // w_o: (d_model, d_model) — output projection
 // b_q, b_k, b_v, b_o: (d_model,) — biases
 
-fn split_heads(m: Matrix, n_heads: Int) -> List[Matrix] = {
-  let data = matrix.to_lists(m)
-  let d_model = list.len(list.get(data, 0) |> option.unwrap_or([]))
-  let d_head = d_model / n_heads
-  list.range(0, n_heads) |> list.map((h) =>
-    matrix.from_lists(list.map(data, (row) => list.slice(row, h * d_head, (h + 1) * d_head)))
-  )
-}
+fn split_heads(m: Matrix, n_heads: Int) -> List[Matrix] =
+  matrix.split_cols_even(m, n_heads)
 
 fn concat_heads(heads: List[Matrix]) -> Matrix =
-  list.fold(list.drop(heads, 1),
-    list.get(heads, 0) |> option.unwrap_or(matrix.zeros(0, 0)),
-    (acc, h) => t.concat_cols(acc, h)
-  )
+  matrix.concat_cols_many(heads)
 
 fn multi_head_attention(
   q_in: Matrix, k_in: Matrix, v_in: Matrix,
@@ -83,17 +65,25 @@ fn multi_head_attention(
   let q = act.linear(q_in, w_q, b_q)
   let k = act.linear(k_in, w_k, b_k)
   let v = act.linear(v_in, w_v, b_v)
-  let q_heads = split_heads(q, n_heads)
-  let k_heads = split_heads(k, n_heads)
-  let v_heads = split_heads(v, n_heads)
-  let attn_heads = list.zip(list.zip(q_heads, k_heads), v_heads)
-    |> list.map((outer) => {
-      let (qk, vi) = outer
-      let (qi, ki) = qk
-      scaled_dot_product(qi, ki, vi)
-    })
-  let concatenated = concat_heads(attn_heads)
-  act.linear(concatenated, w_o, b_o)
+  let attended = matrix.multi_head_attention(q, k, v, n_heads)
+  act.linear(attended, w_o, b_o)
+}
+
+// Causal variant — decoder self-attention. Adds an upper-triangular -inf
+// mask to QK^T so position i only attends to positions 0..i. Required for
+// correctness at inference: without it, the same activations that were
+// computed causally at training time become contaminated by future tokens.
+fn masked_multi_head_attention(
+  q_in: Matrix, k_in: Matrix, v_in: Matrix,
+  w_q: Matrix, w_k: Matrix, w_v: Matrix, w_o: Matrix,
+  b_q: List[Float], b_k: List[Float], b_v: List[Float], b_o: List[Float],
+  n_heads: Int,
+) -> Matrix = {
+  let q = act.linear(q_in, w_q, b_q)
+  let k = act.linear(k_in, w_k, b_k)
+  let v = act.linear(v_in, w_v, b_v)
+  let attended = matrix.masked_multi_head_attention(q, k, v, n_heads)
+  act.linear(attended, w_o, b_o)
 }
 
 // ── Tests ──
@@ -123,8 +113,9 @@ test "softmax attention weights sum to 1" {
   assert(matrix.get(out, 0, 0) <= 1.0)
 }
 
-test "causal_mask is lower triangular" {
-  let m = causal_mask(3)
+test "causal_mask_add applies upper-triangular bias" {
+  let z = matrix.zeros(3, 3)
+  let m = matrix.causal_mask_add(z, -1000000.0)
   // Diagonal and below = 0
   assert_eq(matrix.get(m, 0, 0), 0.0)
   assert_eq(matrix.get(m, 1, 0), 0.0)

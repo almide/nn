@@ -1,0 +1,41 @@
+// Helper: load a WAV, compute mel using GGML-shipped filters, dump to f64 LE bytes.
+// Output file used by the WASM Whisper demo (see whisper_node_demo.mjs).
+
+import self.ggml_whisper as gw
+import self.wav as wav
+import self.mel as mel_mod
+import self.whisper_loader as wl
+import fs
+import env
+
+fn pad_audio(samples: List[Float], target: Int) -> List[Float] = {
+  let cur = list.len(samples)
+  if cur >= target then list.slice(samples, 0, target)
+  else samples + list.map(list.range(0, target - cur), (_) => 0.0)
+}
+
+effect fn main() -> () = {
+  let args = env.args()
+  let model_path = list.get(args, 0) |> option.unwrap_or("/tmp/whisper_demo/ggml-tiny.bin")
+  let audio_path = list.get(args, 1) |> option.unwrap_or("/tmp/whisper_demo/hello.wav")
+  let out_path = list.get(args, 2) |> option.unwrap_or("/tmp/whisper_demo/hello.mel.bin")
+  let model = gw.load(model_path)!
+  let audio = wav.load(audio_path)!
+  println("loaded audio: " + int.to_string(list.len(audio.samples)) + " samples")
+  let padded = pad_audio(audio.samples, 30 * 16000)
+
+  let filters = wl.load_mel_filters(model)
+  let mel_lists = mel_mod.mel_spectrogram_with_filters(padded, filters, 400, 160)
+  let n_frames = list.len(mel_lists)
+  let n_mels = list.len(list.get(mel_lists, 0) |> option.unwrap_or([]))
+  println("mel: " + int.to_string(n_frames) + " x " + int.to_string(n_mels))
+
+  var buf = bytes.new(0)
+  for row in mel_lists {
+    for v in row {
+      bytes.append_f64_le(buf, v)
+    }
+  }
+  fs.write_bytes_raw(out_path, buf)!
+  println("wrote mel to " + out_path + " (" + int.to_string(bytes.len(buf)) + " bytes)")
+}

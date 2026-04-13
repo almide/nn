@@ -1,0 +1,29 @@
+// Isolate causal-mask behaviour on a tiny controlled input.
+//
+// Setup: q = k = v = identity-ish, 1 head. For non-causal, each position's
+// output is the average over all value rows. For causal, position i's
+// output is the average over rows 0..i only.
+
+effect fn main() -> () = {
+  // 3 positions × 2 dims, 1 head so d_head = 2
+  let q = matrix.from_lists([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+  let k = matrix.from_lists([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+  let v = matrix.from_lists([[10.0, 0.0], [0.0, 20.0], [5.0, 5.0]])
+
+  let non_causal = matrix.multi_head_attention(q, k, v, 1)
+  let causal = matrix.masked_multi_head_attention(q, k, v, 1)
+
+  println("--- non-causal ---")
+  println("pos0: " + float.to_string(matrix.get(non_causal, 0, 0)) + ", " + float.to_string(matrix.get(non_causal, 0, 1)))
+  println("pos1: " + float.to_string(matrix.get(non_causal, 1, 0)) + ", " + float.to_string(matrix.get(non_causal, 1, 1)))
+  println("pos2: " + float.to_string(matrix.get(non_causal, 2, 0)) + ", " + float.to_string(matrix.get(non_causal, 2, 1)))
+
+  println("--- causal ---")
+  println("pos0: " + float.to_string(matrix.get(causal, 0, 0)) + ", " + float.to_string(matrix.get(causal, 0, 1)))
+  println("pos1: " + float.to_string(matrix.get(causal, 1, 0)) + ", " + float.to_string(matrix.get(causal, 1, 1)))
+  println("pos2: " + float.to_string(matrix.get(causal, 2, 0)) + ", " + float.to_string(matrix.get(causal, 2, 1)))
+
+  println("")
+  println("Expected causal pos0 = v[0] = (10, 0)  (only attends to self)")
+  println("Expected causal pos2 = matches non-causal pos2 (attends to all)")
+}

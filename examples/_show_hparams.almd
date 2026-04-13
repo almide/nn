@@ -1,0 +1,16 @@
+import self.ggml_whisper as gw
+
+effect fn main() -> () = {
+  let model = gw.load("/tmp/whisper_demo/ggml-tiny.bin")!
+  let h = model.hparams
+  println("n_vocab=" + int.to_string(h.n_vocab))
+  println("n_audio_ctx=" + int.to_string(h.n_audio_ctx))
+  println("n_audio_state=" + int.to_string(h.n_audio_state))
+  println("n_audio_head=" + int.to_string(h.n_audio_head))
+  println("n_audio_layer=" + int.to_string(h.n_audio_layer))
+  println("n_text_ctx=" + int.to_string(h.n_text_ctx))
+  println("n_text_head=" + int.to_string(h.n_text_head))
+  println("n_text_layer=" + int.to_string(h.n_text_layer))
+  println("n_mels=" + int.to_string(h.n_mels))
+  println("ftype=" + int.to_string(h.ftype))
+}

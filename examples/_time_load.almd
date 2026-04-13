@@ -1,0 +1,10 @@
+import self.ggml_whisper as gw
+import fs
+
+effect fn main() -> () = {
+  println("start")
+  let raw = fs.read_bytes_raw("/tmp/whisper_demo/ggml-tiny.bin")!
+  println("file loaded, size=" + int.to_string(bytes.len(raw)))
+  let model = gw.parse(raw)!
+  println("parsed, tensors=" + int.to_string(list.len(model.tensors)))
+}

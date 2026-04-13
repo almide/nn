@@ -1,5 +1,4 @@
 import fs
-import math
 
 // nn.ggml_whisper — Parser for whisper.cpp GGML model files
 //
@@ -50,43 +49,29 @@ type TensorMeta = {
 
 type Model = {
   hparams: Hparams,
-  vocab_offset: Int,      // file offset where vocab starts (skip for now)
-  vocab_end: Int,         // file offset where vocab ends (tensors start here)
-  n_vocab: Int,           // count of tokens in the vocab section
+  mel_filters_offset: Int,  // file offset where mel filter data starts
+  mel_n_mel: Int,           // number of mel bands in stored filterbank (80 for Whisper)
+  mel_n_fft: Int,           // filter length (201 = n_fft/2 + 1)
+  vocab_offset: Int,        // file offset where vocab starts
+  vocab_end: Int,           // file offset where vocab ends (tensors start here)
+  n_vocab: Int,             // count of tokens in the vocab section
   tensors: List[TensorMeta],
-  data: Bytes,            // full file bytes (tokens can be read lazily)
+  data: Bytes,              // full file bytes (tokens can be read lazily)
 }
 
 // ── Low-level bytes readers (little-endian) ──
 //
-// The stdlib `bytes` module only ships big-endian readers today, so we
-// assemble LE values from individual bytes here.
+// Thin wrappers over stdlib primitives. `bytes.read_i32_le` etc. compile to
+// a single WASM `i32.load` / `i64.load` when available, so these are much
+// faster than assembling bytes one at a time.
 
-fn read_u32(data: Bytes, pos: Int) -> Int = {
-  let b0 = bytes.read_u8(data, pos)
-  let b1 = bytes.read_u8(data, pos + 1)
-  let b2 = bytes.read_u8(data, pos + 2)
-  let b3 = bytes.read_u8(data, pos + 3)
-  b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
-}
+fn read_u32(data: Bytes, pos: Int) -> Int = bytes.read_u32_le(data, pos)
+fn read_i32(data: Bytes, pos: Int) -> Int = bytes.read_i32_le(data, pos)
 
-fn read_i32(data: Bytes, pos: Int) -> Int = {
-  let u = read_u32(data, pos)
-  // Sign-extend 32-bit to 64-bit
-  if u >= 2147483648 then u - 4294967296 else u
-}
-
-fn read_bytes_string(data: Bytes, pos: Int, len: Int) -> String = {
-  // Concatenate bytes as ASCII characters. GGML vocab tokens are valid UTF-8
-  // byte sequences; for tokens that happen to be multi-byte, this still
-  // produces the right byte sequence because String in Almide is a raw
-  // byte buffer in the WASM layout.
-  let chars = list.map(list.range(0, len), (i) => {
-    let b = bytes.read_u8(data, pos + i)
-    string.from_codepoint(b)
-  })
-  list.join(chars, "")
-}
+fn read_bytes_string(data: Bytes, pos: Int, len: Int) -> String =
+  // Native UTF-8 slice → String. Previously a lambda-based per-byte concat
+  // forced `data` to be captured by value (moving the Bytes into every call).
+  bytes.read_string_at(data, pos, len)
 
 // ── Parse stages ──
 
@@ -107,28 +92,26 @@ fn parse_hparams(data: Bytes, pos: Int) -> (Hparams, Int) = {
   (h, pos + 44)
 }
 
-// Skip the mel filter bank — we compute our own mels from audio at runtime.
-fn skip_mel_filters(data: Bytes, pos: Int) -> Int = {
+// Read the mel filter header (n_mel, n_fft_filter) and return (filters_data_offset, n_mel, n_fft, next_pos).
+// The filter data itself is (n_mel, n_fft) f32 values at the returned offset.
+fn read_mel_filters_header(data: Bytes, pos: Int) -> (Int, Int, Int, Int) = {
   let n_mel = read_i32(data, pos)
   let n_fft = read_i32(data, pos + 4)
-  pos + 8 + n_mel * n_fft * 4
+  let filters_offset = pos + 8
+  let next_pos = filters_offset + n_mel * n_fft * 4
+  (filters_offset, n_mel, n_fft, next_pos)
 }
 
 // Skip past the vocab section without materialising every token string.
 // Returns (n_vocab, section_start, section_end).
+// Uses native `bytes.skip_length_prefixed_le` to walk 50k+ entries in one call —
+// pure-Almide recursion would clone the 77MB Bytes on every iteration.
 fn skip_vocab(data: Bytes, pos: Int) -> (Int, Int, Int) = {
   let n = read_i32(data, pos)
   let start = pos + 4
-  let end = skip_vocab_loop(data, start, n, 0)
+  let end = bytes.skip_length_prefixed_le(data, start, n)
   (n, start, end)
 }
-
-fn skip_vocab_loop(data: Bytes, pos: Int, total: Int, i: Int) -> Int =
-  if i >= total then pos
-  else {
-    let len = read_i32(data, pos)
-    skip_vocab_loop(data, pos + 4 + len, total, i + 1)
-  }
 
 // Read one vocab entry by index. Does a linear scan from the section start,
 // so repeated calls are O(n); for bulk decoding, callers should materialise
@@ -141,6 +124,11 @@ fn vocab_at_loop(data: Bytes, pos: Int, target: Int, i: Int) -> Option[String] =
   if i == target then some(read_bytes_string(data, pos + 4, len))
   else vocab_at_loop(data, pos + 4 + len, target, i + 1)
 }
+
+// Read the entire vocab as a List[String] in one native pass — O(n), no
+// O(n²) Almide-side append. Indexable by token id.
+fn vocab_all(model: Model) -> List[String] =
+  bytes.read_length_prefixed_strings_le(model.data, model.vocab_offset, model.n_vocab)
 
 // Align `pos` up to the next 32-byte boundary. whisper.cpp pads tensor data
 // to match the GGML memory alignment requirement.
@@ -160,7 +148,9 @@ fn parse_tensor_meta(data: Bytes, pos: Int, total: Int) -> (TensorMeta, Int) = {
   let name_len = read_i32(data, pos + 4)
   let ftype = read_i32(data, pos + 8)
   let dims_start = pos + 12
-  let dims = list.map(list.range(0, n_dims), (i) => read_i32(data, dims_start + i * 4))
+  // Bulk-read dims in one native call — previously a lambda-captured `data`
+  // (a 77MB Bytes) forced ownership, cascading to every caller.
+  let dims = bytes.read_i32_le_array(data, dims_start, n_dims)
   let name_start = dims_start + n_dims * 4
   let name = read_bytes_string(data, name_start, name_len)
   // Element count = product of dims
@@ -199,63 +189,12 @@ fn parse_tensors_loop(data: Bytes, pos: Int, total: Int, acc: List[TensorMeta]) 
 //   - ftype=1: f16 IEEE-754 half precision little-endian
 // Quantised types (ftype >= 2) are not yet supported.
 
-// Decode IEEE-754 single-precision from its 32-bit pattern.
-//   sign [31]  exponent [30:23]  mantissa [22:0]
-fn f32_bits_to_float(bits: Int) -> Float = {
-  let sign = bits / 2147483648
-  let exp_m = bits - sign * 2147483648
-  let exp = exp_m / 8388608
-  let mantissa = exp_m - exp * 8388608
-  let sign_f = if sign == 1 then -1.0 else 1.0
-  if exp == 0 then
-    // Subnormal or zero: value = sign * mantissa * 2^-149
-    sign_f * int.to_float(mantissa) * 1.401298464324817e-45
-  else if exp == 255 then
-    if mantissa == 0 then (if sign == 1 then -3.4028235e38 else 3.4028235e38) else 0.0
-  else {
-    // Normal: (1 + mantissa/2^23) * 2^(exp-127) * sign
-    let m = 1.0 + int.to_float(mantissa) / 8388608.0
-    let e = exp - 127
-    sign_f * m * math.fpow(2.0, int.to_float(e))
-  }
-}
+// Thin wrappers over the new stdlib primitives. Both compile to a single
+// hardware load + convert on Rust, and to a single `call` on WASM (f16
+// expansion is done by a 20-instruction runtime helper).
 
-fn read_f32_le(data: Bytes, pos: Int) -> Float = {
-  let b0 = bytes.read_u8(data, pos)
-  let b1 = bytes.read_u8(data, pos + 1)
-  let b2 = bytes.read_u8(data, pos + 2)
-  let b3 = bytes.read_u8(data, pos + 3)
-  let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
-  f32_bits_to_float(bits)
-}
-
-// F16 → F32 using IEEE-754 half-precision layout.
-//   sign [15]  exponent [14:10]  mantissa [9:0]
-fn f16_to_f32(bits: Int) -> Float = {
-  let sign = bits / 32768
-  let exp_m = bits - sign * 32768   // lower 15 bits
-  let exp = exp_m / 1024            // bits [14:10]
-  let mantissa = exp_m - exp * 1024 // bits [9:0]
-  let sign_f = if sign == 1 then -1.0 else 1.0
-  if exp == 0 then
-    // Subnormal or zero: value = sign * mantissa * 2^-24
-    sign_f * int.to_float(mantissa) * 5.960464477539063e-8  // 2^-24
-  else if exp == 31 then
-    // Inf / NaN — degrade to a large finite number for simplicity
-    if mantissa == 0 then (if sign == 1 then -3.4028235e38 else 3.4028235e38) else 0.0
-  else {
-    // Normal: (1 + mantissa/1024) * 2^(exp-15) * sign
-    let m = 1.0 + int.to_float(mantissa) / 1024.0
-    let e = exp - 15
-    sign_f * m * math.fpow(2.0, int.to_float(e))
-  }
-}
-
-fn read_f16_le(data: Bytes, pos: Int) -> Float = {
-  let b0 = bytes.read_u8(data, pos)
-  let b1 = bytes.read_u8(data, pos + 1)
-  f16_to_f32(b0 + b1 * 256)
-}
+fn read_f32_le(data: Bytes, pos: Int) -> Float = bytes.read_f32_le(data, pos)
+fn read_f16_le(data: Bytes, pos: Int) -> Float = bytes.read_f16_le(data, pos)
 
 fn tensor_to_floats(model: Model, tensor: TensorMeta) -> List[Float] = {
   let elem_count = list.fold(tensor.dims, 1, (acc, d) => acc * d)
@@ -280,11 +219,14 @@ fn parse(data: Bytes) -> Result[Model, String] = {
     if magic != 0x67676d6c then err("not a GGML file (magic mismatch)")
     else {
       let (hparams, pos1) = parse_hparams(data, 4)
-      let pos2 = skip_mel_filters(data, pos1)
+      let (mel_off, mel_n_mel, mel_n_fft, pos2) = read_mel_filters_header(data, pos1)
       let (n_vocab, vocab_start, vocab_end) = skip_vocab(data, pos2)
       let tensors = parse_tensors(data, vocab_end, total)
       ok({
         hparams: hparams,
+        mel_filters_offset: mel_off,
+        mel_n_mel: mel_n_mel,
+        mel_n_fft: mel_n_fft,
         vocab_offset: vocab_start,
         vocab_end: vocab_end,
         n_vocab: n_vocab,
@@ -298,8 +240,8 @@ fn parse(data: Bytes) -> Result[Model, String] = {
 // ── Effect-fn load helper ──
 
 effect fn load(path: String) -> Result[Model, String] =
-  match fs.read_bytes(path) {
-    ok(byte_list) => parse(bytes.from_list(byte_list)),
+  match fs.read_bytes_raw(path) {
+    ok(data) => parse(data),
     err(e) => err("failed to read " + path + ": " + e),
   }
 

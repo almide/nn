@@ -1,0 +1,183 @@
+import self.ggml_whisper as gw
+import self.whisper_loader as wl
+import self.whisper as w
+import self.mel as mel_mod
+import self.activations as act
+import self.transformer as tf
+import self.generate as gen
+import self.wav as wav
+
+effect fn probe(model_bytes: Bytes) -> Int = bytes.len(model_bytes)
+
+fn probe_pure(model_bytes: Bytes) -> Int = bytes.len(model_bytes)
+
+effect fn probe2(model_bytes: Bytes) -> Int = bytes.read_u32_le(model_bytes, 0)
+
+effect fn probe3(model_bytes: Bytes) -> Int = {
+  let m = gw.parse(model_bytes)!
+  m.n_vocab
+}
+
+effect fn probe_vocab_count(model_bytes: Bytes) -> Int = {
+  let m = gw.parse(model_bytes)!
+  let v = gw.vocab_all(m)
+  list.len(v)
+}
+
+effect fn probe_first_token(model_bytes: Bytes) -> String = {
+  let m = gw.parse(model_bytes)!
+  let v = gw.vocab_all(m)
+  list.get(v, 0) |> option.unwrap_or("MISSING")
+}
+
+fn whisper_tiny_en_config() -> w.WhisperConfig = {
+  n_mels: 80, d_model: 384, n_heads: 6,
+  n_audio_ctx: 1500, n_text_ctx: 448,
+  sot_id: 50257, eot_id: 50256,
+  sample_rate: 16000, n_fft: 400, hop_length: 160,
+}
+
+effect fn probe_load_weights(model_bytes: Bytes) -> Int = {
+  let m = gw.parse(model_bytes)!
+  let config = whisper_tiny_en_config()
+  let weights = wl.load_weights(m, config, 4, 4, 51864)
+  matrix.rows(weights.token_embedding)
+}
+
+effect fn probe_mel_first(mel_bytes: Bytes, mel_frames: Int) -> Float = {
+  let m = matrix.from_bytes_f64_le(mel_bytes, 0, mel_frames, 80)
+  matrix.get(m, 0, 0)
+}
+
+effect fn probe_conv1_first(model_bytes: Bytes, mel_bytes: Bytes, mel_frames: Int) -> Float = {
+  let model = gw.parse(model_bytes)!
+  let mel = matrix.from_bytes_f64_le(mel_bytes, 0, mel_frames, 80)
+  let cw = wl.load_conv1_weight(model, 384, 80)
+  let cb = wl.load_conv1_bias(model, 384)
+  let after = matrix.gelu(matrix.conv1d(mel, cw, cb, 3, 1, 1))
+  matrix.get(after, 0, 0)
+}
+
+effect fn probe_encoder1(model_bytes: Bytes, mel_bytes: Bytes, mel_frames: Int) -> Float = {
+  let model = gw.parse(model_bytes)!
+  let config = whisper_tiny_en_config()
+  let weights = wl.load_weights(model, config, 4, 4, 51864)
+  let mel = matrix.from_bytes_f64_le(mel_bytes, 0, mel_frames, 80)
+
+  let cw1 = wl.load_conv1_weight(model, config.d_model, config.n_mels)
+  let cb1 = wl.load_conv1_bias(model, config.d_model)
+  let h1 = matrix.gelu(matrix.conv1d(mel, cw1, cb1, 3, 1, 1))
+
+  let cw2 = wl.load_conv2_weight(model, config.d_model)
+  let cb2 = wl.load_conv2_bias(model, config.d_model)
+  let h2 = matrix.gelu(matrix.conv1d(h1, cw2, cb2, 3, 2, 1))
+
+  let pos = wl.load_encoder_pos_embed(model, config.d_model, config.n_audio_ctx)
+  let ps = matrix.slice_rows(pos, 0, matrix.rows(h2))
+  let with_pos = matrix.add(h2, ps)
+
+  // Run JUST first encoder block
+  let layer0 = list.get(weights.encoder_layers, 0) |> option.unwrap_or(weights.encoder_layers |> list.first |> option.unwrap_or(layer0_dummy()))
+  let after = tf.encoder_block_r(with_pos, layer0, config.n_heads)
+  matrix.get(after, 0, 0)
+}
+
+fn layer0_dummy() -> tf.EncoderLayer = tf.make_zero_encoder_layer(384)
+
+effect fn probe_encoder_full(model_bytes: Bytes, mel_bytes: Bytes, mel_frames: Int) -> Float = {
+  let model = gw.parse(model_bytes)!
+  let config = whisper_tiny_en_config()
+  let weights = wl.load_weights(model, config, 4, 4, 51864)
+  let mel = matrix.from_bytes_f64_le(mel_bytes, 0, mel_frames, 80)
+  let cw1 = wl.load_conv1_weight(model, config.d_model, config.n_mels)
+  let cb1 = wl.load_conv1_bias(model, config.d_model)
+  let h1 = matrix.gelu(matrix.conv1d(mel, cw1, cb1, 3, 1, 1))
+  let cw2 = wl.load_conv2_weight(model, config.d_model)
+  let cb2 = wl.load_conv2_bias(model, config.d_model)
+  let h2 = matrix.gelu(matrix.conv1d(h1, cw2, cb2, 3, 2, 1))
+  let pos = wl.load_encoder_pos_embed(model, config.d_model, config.n_audio_ctx)
+  let ps = matrix.slice_rows(pos, 0, matrix.rows(h2))
+  let xenc = matrix.add(h2, ps)
+  let encoded = tf.encode(xenc, weights.encoder_layers, config.n_heads)
+  let encoder_out = act.layer_norm(encoded, weights.encoder_ln_gamma, weights.encoder_ln_beta)
+  matrix.get(encoder_out, 0, 0)
+}
+
+effect fn probe_decode1(model_bytes: Bytes, mel_bytes: Bytes, mel_frames: Int) -> Int = {
+  let model = gw.parse(model_bytes)!
+  let config = whisper_tiny_en_config()
+  let weights = wl.load_weights(model, config, 4, 4, 51864)
+  let mel = matrix.from_bytes_f64_le(mel_bytes, 0, mel_frames, 80)
+  let cw1 = wl.load_conv1_weight(model, config.d_model, config.n_mels)
+  let cb1 = wl.load_conv1_bias(model, config.d_model)
+  let h1 = matrix.gelu(matrix.conv1d(mel, cw1, cb1, 3, 1, 1))
+  let cw2 = wl.load_conv2_weight(model, config.d_model)
+  let cb2 = wl.load_conv2_bias(model, config.d_model)
+  let h2 = matrix.gelu(matrix.conv1d(h1, cw2, cb2, 3, 2, 1))
+  let pos = wl.load_encoder_pos_embed(model, config.d_model, config.n_audio_ctx)
+  let ps = matrix.slice_rows(pos, 0, matrix.rows(h2))
+  let xenc = matrix.add(h2, ps)
+  let encoded = tf.encode(xenc, weights.encoder_layers, config.n_heads)
+  let encoder_out = act.layer_norm(encoded, weights.encoder_ln_gamma, weights.encoder_ln_beta)
+
+  // One decode step
+  let prefix = [50257, 50358, 50362]
+  let dec_pos = wl.load_decoder_pos_embed(model, config.d_model, config.n_text_ctx)
+  let suppress: List[Int] = []
+  gen.decode_step_pos(prefix, encoder_out, weights.decoder_layers, config.n_heads,
+    weights.token_embedding, dec_pos,
+    weights.decoder_ln_gamma, weights.decoder_ln_beta, suppress)
+}
+
+effect fn probe_encoder_n(model_bytes: Bytes, mel_bytes: Bytes, mel_frames: Int, n_blocks: Int) -> Float = {
+  let model = gw.parse(model_bytes)!
+  let config = whisper_tiny_en_config()
+  let weights = wl.load_weights(model, config, 4, 4, 51864)
+  let mel = matrix.from_bytes_f64_le(mel_bytes, 0, mel_frames, 80)
+
+  let cw1 = wl.load_conv1_weight(model, config.d_model, config.n_mels)
+  let cb1 = wl.load_conv1_bias(model, config.d_model)
+  let h1 = matrix.gelu(matrix.conv1d(mel, cw1, cb1, 3, 1, 1))
+
+  let cw2 = wl.load_conv2_weight(model, config.d_model)
+  let cb2 = wl.load_conv2_bias(model, config.d_model)
+  let h2 = matrix.gelu(matrix.conv1d(h1, cw2, cb2, 3, 2, 1))
+
+  let pos = wl.load_encoder_pos_embed(model, config.d_model, config.n_audio_ctx)
+  let ps = matrix.slice_rows(pos, 0, matrix.rows(h2))
+  let x = matrix.add(h2, ps)
+
+  let layers = list.slice(weights.encoder_layers, 0, n_blocks)
+  let after = tf.encode(x, layers, config.n_heads)
+  matrix.get(after, 0, 0)
+}
+
+effect fn probe_load_filter(model_bytes: Bytes) -> Int = {
+  let m = gw.parse(model_bytes)!
+  let filters = wl.load_mel_filters(m)
+  list.len(filters)
+}
+
+effect fn probe_load_conv1(model_bytes: Bytes) -> Int = {
+  let m = gw.parse(model_bytes)!
+  let cw = wl.load_conv1_weight(m, 384, 80)
+  matrix.rows(cw)
+}
+
+fn pad_audio(samples: List[Float], target: Int) -> List[Float] = {
+  let cur = list.len(samples)
+  if cur >= target then list.slice(samples, 0, target)
+  else samples + list.map(list.range(0, target - cur), (_) => 0.0)
+}
+
+effect fn probe_mel(model_bytes: Bytes, audio_bytes: Bytes) -> Int = {
+  let m = gw.parse(model_bytes)!
+  let a = wav.parse(audio_bytes)!
+  let padded = pad_audio(a.samples, 30 * 16000)
+  let filters = wl.load_mel_filters(m)
+  let mel_lists = mel_mod.mel_spectrogram_with_filters(padded, filters, 400, 160)
+  let mel_mat = matrix.from_lists(mel_lists)
+  matrix.rows(mel_mat)
+}
+
+effect fn probe_const() -> Int = 42

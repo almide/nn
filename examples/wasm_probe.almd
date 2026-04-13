@@ -1,0 +1,3 @@
+effect fn probe(data: Bytes) -> Int = {
+  bytes.read_i32_le(data, 0)
+}

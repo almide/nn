@@ -1,0 +1,53 @@
+// Compare two paths for turning GGML tensor bytes into a Matrix:
+//   Old path: read N f16 values into List[Float], then (conceptually)
+//             reshape row-by-row — iterates in Almide land, allocating
+//             intermediate Vec<f64>.
+//   New path: matrix.from_bytes_f16_le — single native call, one-shot
+//             Vec<Vec<f64>> construction.
+//
+// encoder.blocks.0 has several 384x1536 = 589k element F16 tensors —
+// exactly the shape that benefits most.
+
+import self.ggml_whisper as gw
+import env
+
+fn bench_old(model: gw.Model, t: gw.TensorMeta) -> Int = {
+  // Pure-Almide: read each element, accumulate in a list.
+  // We stop at just materialising the list so the per-element cost is
+  // what we measure.
+  let flat = gw.tensor_to_floats(model, t)
+  list.len(flat)
+}
+
+fn bench_new(model: gw.Model, t: gw.TensorMeta) -> Int = {
+  let rows = list.get(t.dims, 0) ?? 1
+  let cols = list.get(t.dims, 1) ?? 1
+  let m = match t.ftype {
+    0 => matrix.from_bytes_f32_le(model.data, t.data_offset, rows, cols),
+    1 => matrix.from_bytes_f16_le(model.data, t.data_offset, rows, cols),
+    _ => matrix.zeros(1, 1),
+  }
+  let (r, c) = matrix.shape(m)
+  r * c
+}
+
+effect fn main() -> () = {
+  let model = gw.load("/tmp/whisper_demo/ggml-tiny.bin")!
+  let name = "encoder.blocks.0.mlp.0.weight"  // 384x1536 F16 = ~1.2MB, 590k elems
+  match gw.find_tensor(model.tensors, name) {
+    some(t) => {
+      println("Tensor: " + name + " [" + int.to_string(list.get(t.dims, 0) ?? 0) + "x" + int.to_string(list.get(t.dims, 1) ?? 0) + "] ftype=" + int.to_string(t.ftype))
+
+      let t0 = env.millis()
+      let count_old = bench_old(model, t)
+      let t1 = env.millis()
+      println("OLD (list path):     " + int.to_string(count_old) + " elems in " + int.to_string(t1 - t0) + " ms")
+
+      let t2 = env.millis()
+      let count_new = bench_new(model, t)
+      let t3 = env.millis()
+      println("NEW (from_bytes):    " + int.to_string(count_new) + " elems in " + int.to_string(t3 - t2) + " ms")
+    },
+    none => println("tensor not found: " + name),
+  }
+}

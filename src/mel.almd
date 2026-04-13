@@ -39,26 +39,23 @@ fn create_mel_filters(n_mels: Int, n_fft: Int, sample_rate: Int) -> List[List[Fl
   let mel_points = linspace(mel_low, mel_high, n_mels + 2)
   let hz_points = list.map(mel_points, (m) => mel_to_hz(m))
 
-  // Convert Hz to FFT bin indices
-  let bin_points = list.map(hz_points, (hz) =>
-    float.to_int(hz * int.to_float(n_fft) / sr)
-  )
-
-  // Build triangular filters
+  // Build triangular filters in continuous frequency space (Slaney style):
+  // each filter is evaluated per FFT bin at that bin's real frequency.
+  // bin k corresponds to frequency k * sr / n_fft.
   list.range(0, n_mels) |> list.map((i) => {
-    let left = list.get(bin_points, i) |> option.unwrap_or(0)
-    let center = list.get(bin_points, i + 1) |> option.unwrap_or(0)
-    let right = list.get(bin_points, i + 2) |> option.unwrap_or(0)
-    list.range(0, n_freq) |> list.map((k) =>
-      if k < left then 0.0
-      else if k < center then
-        if center == left then 0.0
-        else int.to_float(k - left) / int.to_float(center - left)
-      else if k < right then
-        if right == center then 0.0
-        else int.to_float(right - k) / int.to_float(right - center)
-      else 0.0
-    )
+    let left_hz = list.get(hz_points, i) |> option.unwrap_or(0.0)
+    let center_hz = list.get(hz_points, i + 1) |> option.unwrap_or(0.0)
+    let right_hz = list.get(hz_points, i + 2) |> option.unwrap_or(0.0)
+    // Slaney normalization: unit area per filter = 2 / (right - left)
+    let enorm = 2.0 / (right_hz - left_hz)
+    list.range(0, n_freq) |> list.map((k) => {
+      let freq = int.to_float(k) * sr / int.to_float(n_fft)
+      let h = if freq < left_hz then 0.0
+              else if freq < center_hz then (freq - left_hz) / (center_hz - left_hz)
+              else if freq < right_hz then (right_hz - freq) / (right_hz - center_hz)
+              else 0.0
+      h * enorm
+    })
   })
 }
 
@@ -99,21 +96,68 @@ fn mel_spectrogram(
   let padded_len = fft.next_power_of_2(n_fft)
 
   let frames = extract_frames(samples, n_fft, hop_size)
-  list.map(frames, (frame) => {
-    // Apply window + zero-pad to power of 2
+  // First pass: log-mel (base 10, floor 1e-10 like Whisper)
+  let raw = list.map(frames, (frame) => {
     let windowed = apply_window(frame, window)
     let padded = fft.zero_pad(windowed, padded_len)
-    // FFT → power spectrum
     let spectrum = fft.power_spectrum(padded)
-    // Apply mel filterbank
     list.map(filters, (filter) => {
       let energy = list.zip(filter, spectrum)
         |> list.fold(0.0, (acc, pair) => acc + pair.0 * pair.1)
-      // Log scale with floor to avoid log(0)
-      let floor = 0.000001
-      math.log(if energy > floor then energy else floor)
+      let floor = 0.0000000001  // 1e-10 matches whisper.cpp
+      math.log10(if energy > floor then energy else floor)
     })
   })
+  // Whisper normalization: clamp log_mel to max - 8, then (x + 4) / 4.
+  // Matches whisper.cpp's pad_or_trim + log_mel preprocessing.
+  let flat_max = raw
+    |> list.map((row) =>
+        list.fold(row, -1.0e30, (acc, x) => if x > acc then x else acc))
+    |> list.fold(-1.0e30, (acc, x) => if x > acc then x else acc)
+  let lo = flat_max - 8.0
+  list.map(raw, (row) =>
+    list.map(row, (x) => {
+      let clamped = if x > lo then x else lo
+      (clamped + 4.0) / 4.0
+    }))
+}
+
+// ── Variant using pre-computed mel filters (Whisper GGML ships these) ──
+//
+// When the filterbank is provided (shape n_mels × n_freq), we skip
+// create_mel_filters entirely. This guarantees bit-exact compatibility
+// with whisper.cpp's preprocessing.
+
+fn mel_spectrogram_with_filters(
+  samples: List[Float],
+  filters: List[List[Float]],
+  n_fft: Int,
+  hop_size: Int,
+) -> List[List[Float]] = {
+  let window = hann_window(n_fft)
+  let padded_len = fft.next_power_of_2(n_fft)
+  let frames = extract_frames(samples, n_fft, hop_size)
+  let raw = list.map(frames, (frame) => {
+    let windowed = apply_window(frame, window)
+    let padded = fft.zero_pad(windowed, padded_len)
+    let spectrum = fft.power_spectrum(padded)
+    list.map(filters, (filter) => {
+      let energy = list.zip(filter, spectrum)
+        |> list.fold(0.0, (acc, pair) => acc + pair.0 * pair.1)
+      let floor = 0.0000000001
+      math.log10(if energy > floor then energy else floor)
+    })
+  })
+  let flat_max = raw
+    |> list.map((row) =>
+        list.fold(row, -1.0e30, (acc, x) => if x > acc then x else acc))
+    |> list.fold(-1.0e30, (acc, x) => if x > acc then x else acc)
+  let lo = flat_max - 8.0
+  list.map(raw, (row) =>
+    list.map(row, (x) => {
+      let clamped = if x > lo then x else lo
+      (clamped + 4.0) / 4.0
+    }))
 }
 
 // ── Whisper-specific parameters ──
