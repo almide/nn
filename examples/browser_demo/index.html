@@ -7,43 +7,73 @@
   body { font: 14px/1.5 -apple-system, system-ui, sans-serif; max-width: 720px; margin: 2em auto; padding: 0 1em; color: #222; }
   h1 { font-size: 1.4em; }
   fieldset { border: 1px solid #ccc; padding: 1em; margin: 1em 0; }
-  label { display: block; margin: 0.4em 0; }
-  input[type=number] { width: 5em; }
-  button { padding: 0.6em 1em; font-size: 1em; }
+  legend { font-weight: bold; }
+  button { padding: 0.6em 1em; font-size: 1em; margin: 0.2em 0.4em 0.2em 0; }
   button:disabled { opacity: 0.5; }
-  pre { background: #f4f4f4; padding: 1em; white-space: pre-wrap; word-break: break-word; }
-  .result { font-size: 1.2em; padding: 1em; background: #efe; border-left: 4px solid #4a4; }
-  .status { color: #666; font-style: italic; }
+  input[type=number] { width: 5em; }
+  pre { background: #f4f4f4; padding: 1em; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow: auto; }
+  .result { font-size: 1.2em; padding: 1em; background: #efe; border-left: 4px solid #4a4; margin: 1em 0; }
+  .status { color: #666; font-style: italic; margin: 0.4em 0; }
   .error { color: #c33; }
+  .recording { color: #c33; font-weight: bold; }
+  .step { margin: 0.4em 0; }
 </style>
 </head>
 <body>
 <h1>Almide WASM Whisper — Browser Demo</h1>
 
-<p>
-Run OpenAI Whisper inference compiled to WebAssembly from
-<a href="https://github.com/almide/almide">Almide</a>. Pure Almide
-implementation — no JS ML framework, no native bindings.
-</p>
+<p>Whisper inference compiled from <a href="https://github.com/almide/almide">Almide</a> to WebAssembly.
+Pure Almide implementation, no JS ML framework.</p>
 
 <fieldset>
-  <legend>Inputs</legend>
-  <label>WASM module <code>(whisper_wasm_entry.wasm)</code>:
-    <input id="wasm" type="file" accept=".wasm" />
-  </label>
-  <label>Whisper model <code>(ggml-tiny.bin, 74 MB)</code>:
-    <input id="model" type="file" accept=".bin" />
-  </label>
-  <label>Pre-computed mel <code>(*.mel.bin, f64 LE, frames × 80)</code>:
-    <input id="mel" type="file" accept=".bin" />
-  </label>
-  <label>Max new tokens:
-    <input id="maxnew" type="number" value="30" min="1" max="200" />
-  </label>
-  <button id="run" disabled>Transcribe</button>
+  <legend>1. Initialize</legend>
+  <div class="step">
+    <button id="loadModel">Load Whisper model (74 MB)</button>
+    <span id="modelStatus" class="status">not loaded</span>
+  </div>
 </fieldset>
 
-<div id="status" class="status">Select files to enable Transcribe.</div>
+<fieldset>
+  <legend>2. Audio source</legend>
+  <div class="step">
+    Mic device:
+    <select id="micDevice"><option value="">(default — first allow mic permission)</option></select>
+    <button id="refreshDevices">Refresh</button>
+  </div>
+  <div class="step">
+    <button id="recordBtn" disabled>● Record from mic</button>
+    <button id="stopBtn" disabled>■ Stop</button>
+    <span id="recStatus" class="status">idle</span>
+  </div>
+  <div class="step">
+    or <input id="fileInput" type="file" accept="audio/*" disabled />
+    <button id="loadSample" disabled>Load sample (hello.wav)</button>
+  </div>
+  <div class="step">
+    <audio id="player" controls style="width: 100%; margin-top: 0.4em;"></audio>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>3. Transcribe</legend>
+  <div class="step">
+    Language:
+    <select id="lang">
+      <option value="0" selected>English (tiny.en — current model)</option>
+      <option value="50258">en (multilingual model only)</option>
+      <option value="50265">ja (multilingual model only)</option>
+      <option value="50259">zh (multilingual model only)</option>
+      <option value="50260">de (multilingual model only)</option>
+      <option value="50261">es (multilingual model only)</option>
+      <option value="50263">ko (multilingual model only)</option>
+      <option value="50264">fr (multilingual model only)</option>
+    </select>
+    Max tokens: <input id="maxnew" type="number" value="50" min="1" max="200" />
+    <button id="run" disabled>Transcribe</button>
+  </div>
+  <div id="status" class="status">Load the model to begin.</div>
+</fieldset>
+
 <div id="result"></div>
 
 <details>
@@ -53,108 +83,355 @@ implementation — no JS ML framework, no native bindings.
 
 <script type="module">
 import { makeWasi } from './wasi_shim.js';
+import { logMelSpectrogram } from './mel.js';
 
 const $ = (id) => document.getElementById(id);
-const log = (msg) => { $('log').textContent += msg + '\n'; };
+const log = (msg) => { console.log('[demo]', msg); $('log').textContent += msg + '\n'; $('log').scrollTop = $('log').scrollHeight; };
 const status = (msg, cls = 'status') => { $('status').className = cls; $('status').textContent = msg; };
+const modelStatus = (msg, cls = 'status') => { $('modelStatus').className = cls; $('modelStatus').textContent = msg; };
+const recStatus = (msg, cls = 'status') => { $('recStatus').className = cls; $('recStatus').textContent = msg; };
 
-let wasmBuf = null, modelBuf = null, melBuf = null;
+let wasmInstance = null;
+let modelPtr = null;
+let melFilters = null;
+let currentSamples = null; // Float32Array @ 16 kHz mono
 
-function checkReady() {
-  const ok = wasmBuf && modelBuf && melBuf;
-  $('run').disabled = !ok;
-  if (ok) status('Ready. Click Transcribe.');
-}
-
-async function readFile(file) {
-  return new Uint8Array(await file.arrayBuffer());
-}
-
-$('wasm').addEventListener('change', async (e) => {
-  const f = e.target.files[0];
-  if (!f) return;
-  status(`Loading WASM ${f.name}...`);
-  wasmBuf = await readFile(f);
-  log(`WASM loaded: ${wasmBuf.length} bytes`);
-  checkReady();
-});
-
-$('model').addEventListener('change', async (e) => {
-  const f = e.target.files[0];
-  if (!f) return;
-  status(`Loading model ${f.name} (${(f.size / 1024 / 1024).toFixed(1)} MB)...`);
-  modelBuf = await readFile(f);
-  log(`Model loaded: ${(modelBuf.length / 1024 / 1024).toFixed(1)} MB`);
-  checkReady();
-});
-
-$('mel').addEventListener('change', async (e) => {
-  const f = e.target.files[0];
-  if (!f) return;
-  status(`Loading mel ${f.name}...`);
-  melBuf = await readFile(f);
-  const frames = melBuf.length / 8 / 80;
-  log(`Mel loaded: ${melBuf.length} bytes (= ${frames} frames × 80 mels)`);
-  checkReady();
-});
-
-$('run').addEventListener('click', async () => {
-  $('run').disabled = true;
-  $('result').innerHTML = '';
+// ── Load WASM module + Whisper weights ──
+$('loadModel').addEventListener('click', async () => {
+  $('loadModel').disabled = true;
+  modelStatus('downloading WASM + model...');
   try {
-    status('Instantiating WASM...');
+    const [wasmRes, modelRes] = await Promise.all([
+      fetch('whisper_wasm_entry.wasm'),
+      fetch('model.bin'),
+    ]);
+    const wasmBuf = new Uint8Array(await wasmRes.arrayBuffer());
+    const modelBuf = new Uint8Array(await modelRes.arrayBuffer());
+    log(`WASM ${wasmBuf.length}b, model ${(modelBuf.length / 1024 / 1024).toFixed(1)}MB`);
+
     const wasi = makeWasi({
       stdout: (s) => log('[stdout] ' + s),
       stderr: (s) => log('[stderr] ' + s),
     });
-    const t0 = performance.now();
     const { instance } = await WebAssembly.instantiate(wasmBuf, wasi.imports);
     wasi.setMemory(instance.exports.memory);
     if (instance.exports._initialize) instance.exports._initialize();
-    log(`Instantiated in ${(performance.now() - t0).toFixed(1)} ms`);
+    wasmInstance = instance;
 
-    const { memory, __alloc, transcribe } = instance.exports;
+    modelStatus('writing model into WASM memory...');
+    const { memory, __alloc } = instance.exports;
+    const ptr = (__alloc(4 + modelBuf.length) >>> 0);
+    new DataView(memory.buffer).setInt32(ptr, modelBuf.length, true);
+    new Uint8Array(memory.buffer).set(modelBuf, ptr + 4);
+    modelPtr = ptr;
 
-    const writeBytes = (buf) => {
-      const ptr = (__alloc(4 + buf.length) >>> 0);
-      const view = new DataView(memory.buffer);
-      view.setInt32(ptr, buf.length, true);
-      new Uint8Array(memory.buffer).set(buf, ptr + 4);
-      return ptr;
+    modelStatus('extracting mel filterbank...');
+    const filtResultPtr = instance.exports.get_mel_filters(modelPtr);
+    const fr = new DataView(memory.buffer).getInt32(filtResultPtr >>> 0, true);
+    if (fr !== 0) throw new Error('get_mel_filters returned Err');
+    const filtBytesPtr = (new DataView(memory.buffer).getInt32((filtResultPtr >>> 0) + 4, true) >>> 0);
+    const filtLen = new DataView(memory.buffer).getInt32(filtBytesPtr, true);
+    melFilters = new Float64Array(filtLen / 8);
+    const fv = new DataView(memory.buffer, filtBytesPtr + 4, filtLen);
+    for (let i = 0; i < melFilters.length; i++) melFilters[i] = fv.getFloat64(i * 8, true);
+    log(`mel filters: ${melFilters.length} cells (80 × ${melFilters.length / 80})`);
+
+    modelStatus('ready', 'status');
+    status('Record audio or upload a file, then click Transcribe.');
+    $('recordBtn').disabled = false;
+    $('fileInput').disabled = false;
+    $('loadSample').disabled = false;
+  } catch (err) {
+    modelStatus('error: ' + err.message, 'error');
+    log('ERROR: ' + (err.stack || err));
+    $('loadModel').disabled = false;
+  }
+});
+
+// ── Mic device enumeration ──
+async function refreshDevices() {
+  try {
+    // Need permission before labels are populated.
+    let needsPermission = false;
+    try {
+      const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+      tmp.getTracks().forEach(t => t.stop());
+    } catch (e) { needsPermission = true; }
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const mics = devices.filter(d => d.kind === 'audioinput');
+    const sel = $('micDevice');
+    sel.innerHTML = '';
+    sel.appendChild(new Option('(system default)', ''));
+    for (const d of mics) {
+      const label = d.label || `mic ${d.deviceId.slice(0, 8)}`;
+      sel.appendChild(new Option(label, d.deviceId));
+    }
+    log(`enumerated ${mics.length} mic device(s): ${mics.map(d => d.label).join(' | ')}`);
+  } catch (e) {
+    log('enumerateDevices error: ' + e.message);
+  }
+}
+$('refreshDevices').addEventListener('click', refreshDevices);
+refreshDevices();
+
+// ── Recording via AudioContext + AudioWorklet (direct PCM capture) ──
+// The recorder worklet posts each 128-frame block back to this thread; we
+// accumulate, then resample to 16 kHz mono via OfflineAudioContext.
+let recCtx = null, recStream = null, recNode = null, recSource = null;
+let pcmChunks = [];
+let pcmTotalLen = 0;
+
+$('recordBtn').addEventListener('click', async () => {
+  pcmChunks = [];
+  pcmTotalLen = 0;
+  try {
+    const deviceId = $('micDevice').value;
+    const audioConstraint = { channelCount: 1, echoCancellation: true, noiseSuppression: true };
+    if (deviceId) audioConstraint.deviceId = { exact: deviceId };
+    recStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint });
+    recCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (recCtx.state === 'suspended') await recCtx.resume();
+    log(`recording AudioContext sampleRate: ${recCtx.sampleRate} Hz, state ${recCtx.state}`);
+    await recCtx.audioWorklet.addModule('record-worklet.js');
+    recNode = new AudioWorkletNode(recCtx, 'almide-recorder', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    });
+    recNode.port.onmessage = (e) => {
+      const buf = e.data;
+      pcmChunks.push(buf);
+      pcmTotalLen += buf.length;
     };
-    const readString = (ptr) => {
-      const view = new DataView(memory.buffer);
-      const len = view.getInt32(ptr, true);
-      return new TextDecoder().decode(new Uint8Array(memory.buffer, ptr + 4, len));
-    };
-    const unwrapResultString = (rawPtr) => {
-      const ptr = rawPtr >>> 0;
-      const view = new DataView(memory.buffer);
-      const tag = view.getInt32(ptr, true);
-      const payload = view.getInt32(ptr + 4, true) >>> 0;
-      if (tag !== 0) throw new Error('Almide returned Err: ' + readString(payload));
-      return readString(payload);
-    };
+    const tracks = recStream.getAudioTracks();
+    log(`audio tracks: ${tracks.length}, track[0]: enabled=${tracks[0].enabled}, muted=${tracks[0].muted}, readyState=${tracks[0].readyState}, label="${tracks[0].label}"`);
 
-    status('Writing model + mel to WASM memory...');
-    const t1 = performance.now();
-    const modelPtr = writeBytes(modelBuf);
-    const melPtr = writeBytes(melBuf);
-    log(`Memory ready in ${(performance.now() - t1).toFixed(1)} ms`);
+    recSource = recCtx.createMediaStreamSource(recStream);
 
-    const melFrames = melBuf.length / 8 / 80;
+    // Diagnostic: AnalyserNode in parallel — measures peak directly off the source.
+    const analyser = recCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    recSource.connect(analyser);
+    const probeBuf = new Float32Array(analyser.fftSize);
+    let probePeak = 0;
+    const probeInterval = setInterval(() => {
+      analyser.getFloatTimeDomainData(probeBuf);
+      let p = 0; for (let i = 0; i < probeBuf.length; i++) { const a = Math.abs(probeBuf[i]); if (a > p) p = a; }
+      if (p > probePeak) probePeak = p;
+    }, 100);
+    recNode._probeInterval = probeInterval;
+    recNode._probePeakRef = () => probePeak;
+
+    // Route through a muted gain so the graph is "active" and process() runs,
+    // but no audio actually plays back.
+    const muted = recCtx.createGain();
+    muted.gain.value = 0;
+    recSource.connect(recNode);
+    recNode.connect(muted).connect(recCtx.destination);
+    recStatus('● recording...', 'recording');
+    $('recordBtn').disabled = true;
+    $('stopBtn').disabled = false;
+  } catch (err) {
+    recStatus('mic error: ' + err.message, 'error');
+    log('ERROR: ' + (err.stack || err));
+  }
+});
+
+$('stopBtn').addEventListener('click', async () => {
+  if (!recCtx) return;
+  $('stopBtn').disabled = true;
+  recStatus('processing...');
+  try {
+    if (recNode._probeInterval) clearInterval(recNode._probeInterval);
+    const probePeak = recNode._probePeakRef ? recNode._probePeakRef() : -1;
+    log(`AnalyserNode probePeak (off source): ${probePeak.toFixed(4)}`);
+    recSource.disconnect();
+    recNode.disconnect();
+    recStream.getTracks().forEach((t) => t.stop());
+
+    // Concatenate chunks into one Float32Array at the source sample rate.
+    const srcRate = recCtx.sampleRate;
+    const srcLen = pcmTotalLen;
+    const srcBuf = new Float32Array(srcLen);
+    let offset = 0;
+    for (const c of pcmChunks) { srcBuf.set(c, offset); offset += c.length; }
+    let srcPeak = 0;
+    for (let i = 0; i < srcLen; i++) {
+      const a = Math.abs(srcBuf[i]);
+      if (a > srcPeak) srcPeak = a;
+    }
+    log(`captured ${pcmChunks.length} chunks, ${srcLen} samples @ ${srcRate} Hz (${(srcLen / srcRate).toFixed(2)}s), srcPeak ${srcPeak.toFixed(4)}`);
+    if (pcmChunks.length === 0) log('FATAL: worklet process() was never called — graph not active');
+    else if (srcPeak === 0) log('FATAL: process() ran but input was all zeros — mic not flowing into worklet');
+
+    // Build an AudioBuffer at source rate, then resample to 16 kHz via OfflineAudioContext.
+    const ab = recCtx.createBuffer(1, srcLen, srcRate);
+    ab.getChannelData(0).set(srcBuf);
+
+    // Provide a playable WAV preview — also normalize for audibility.
+    let previewSrc = srcBuf;
+    if (srcPeak > 0.001) {
+      const g = 0.7 / srcPeak;
+      previewSrc = new Float32Array(srcLen);
+      for (let i = 0; i < srcLen; i++) previewSrc[i] = srcBuf[i] * g;
+    }
+    $('player').src = URL.createObjectURL(makeWavBlob(previewSrc, srcRate));
+
+    const targetRate = 16000;
+    const targetLen = Math.ceil(srcLen * targetRate / srcRate);
+    const offline = new OfflineAudioContext(1, targetLen, targetRate);
+    const src = offline.createBufferSource();
+    src.buffer = ab;
+    src.connect(offline.destination);
+    src.start(0);
+    const rendered = await offline.startRendering();
+    currentSamples = rendered.getChannelData(0).slice();
+
+    let peak = 0, sumsq = 0;
+    for (let i = 0; i < currentSamples.length; i++) {
+      const a = Math.abs(currentSamples[i]);
+      if (a > peak) peak = a;
+      sumsq += currentSamples[i] * currentSamples[i];
+    }
+    const rms = Math.sqrt(sumsq / currentSamples.length);
+    log(`raw: ${currentSamples.length} samples, peak ${peak.toFixed(4)}, rms ${rms.toFixed(4)}`);
+
+    // Normalize peak to 0.7 so Whisper sees a reasonable input level. macOS mic
+    // input can be very quiet (peak ~0.02), which the model treats as silence.
+    if (peak > 0.001) {
+      const gain = 0.7 / peak;
+      for (let i = 0; i < currentSamples.length; i++) currentSamples[i] *= gain;
+      log(`normalized: gain ×${gain.toFixed(2)} (peak now ~0.7)`);
+    }
+    recStatus(`${currentSamples.length} samples @ 16 kHz mono, raw peak ${peak.toFixed(3)}, normalized to 0.7`);
+    if (peak < 0.005) log('WARNING: raw peak < 0.005 — mic likely muted/very quiet');
+
+    recCtx.close();
+    recCtx = null;
+    $('recordBtn').disabled = false;
+    if (modelPtr !== null) $('run').disabled = false;
+  } catch (err) {
+    recStatus('processing error: ' + err.message, 'error');
+    log('ERROR: ' + (err.stack || err));
+    $('recordBtn').disabled = false;
+  }
+});
+
+// Encode Float32Array as a 16-bit PCM WAV blob (for the preview <audio>).
+function makeWavBlob(samples, sampleRate) {
+  const n = samples.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  let p = 0;
+  const wstr = (s) => { for (let i = 0; i < s.length; i++) v.setUint8(p++, s.charCodeAt(i)); };
+  const w32 = (x) => { v.setUint32(p, x, true); p += 4; };
+  const w16 = (x) => { v.setUint16(p, x, true); p += 2; };
+  wstr('RIFF'); w32(36 + n * 2); wstr('WAVE');
+  wstr('fmt '); w32(16); w16(1); w16(1); w32(sampleRate); w32(sampleRate * 2); w16(2); w16(16);
+  wstr('data'); w32(n * 2);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(p, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    p += 2;
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+$('fileInput').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $('player').src = URL.createObjectURL(f);
+  await loadAudioBlob(f);
+});
+
+$('loadSample').addEventListener('click', async () => {
+  $('loadSample').disabled = true;
+  recStatus('fetching hello.wav...');
+  try {
+    const blob = await fetch('hello.wav').then(r => r.blob());
+    $('player').src = URL.createObjectURL(blob);
+    await loadAudioBlob(blob);
+  } catch (err) {
+    recStatus('sample fetch error: ' + err.message, 'error');
+  } finally {
+    $('loadSample').disabled = false;
+  }
+});
+
+async function loadAudioBlob(blob) {
+  recStatus('decoding to 16 kHz mono...');
+  try {
+    const arrayBuf = await blob.arrayBuffer();
+    // Decode at native sample rate
+    const tmpCtx = new AudioContext();
+    const decoded = await tmpCtx.decodeAudioData(arrayBuf);
+    tmpCtx.close();
+
+    // Resample to 16 kHz mono via OfflineAudioContext
+    const targetRate = 16000;
+    const targetLen = Math.ceil((decoded.duration) * targetRate);
+    const offline = new OfflineAudioContext(1, targetLen, targetRate);
+    const src = offline.createBufferSource();
+    src.buffer = decoded;
+    src.connect(offline.destination);
+    src.start(0);
+    const rendered = await offline.startRendering();
+    currentSamples = rendered.getChannelData(0).slice();
+    let peak = 0, sumsq = 0;
+    for (let i = 0; i < currentSamples.length; i++) {
+      const a = Math.abs(currentSamples[i]);
+      if (a > peak) peak = a;
+      sumsq += currentSamples[i] * currentSamples[i];
+    }
+    const rms = Math.sqrt(sumsq / currentSamples.length);
+    recStatus(`${currentSamples.length} samples (${(currentSamples.length / 16000).toFixed(2)} s @ 16 kHz mono), peak ${peak.toFixed(3)}, rms ${rms.toFixed(4)}`);
+    log(`audio decoded: ${currentSamples.length} samples, peak ${peak.toFixed(3)}, rms ${rms.toFixed(4)}, srcRate ${decoded.sampleRate}, srcChannels ${decoded.numberOfChannels}`);
+    if (peak < 0.01) log('WARNING: audio peak < 0.01 — likely silent or mic muted');
+    $('recordBtn').disabled = false;
+    if (modelPtr !== null) $('run').disabled = false;
+  } catch (err) {
+    recStatus('decode error: ' + err.message, 'error');
+    $('recordBtn').disabled = false;
+  }
+}
+
+// ── Transcribe ──
+$('run').addEventListener('click', async () => {
+  if (!wasmInstance || !currentSamples) return;
+  $('run').disabled = true;
+  $('result').innerHTML = '';
+  try {
+    status('computing mel spectrogram (JS)...');
+    const t0 = performance.now();
+    const mel = logMelSpectrogram(currentSamples, melFilters);
+    log(`mel computed in ${(performance.now() - t0).toFixed(0)} ms (${mel.length / 80} frames)`);
+
+    const { memory, __alloc, transcribe } = wasmInstance.exports;
+    const melBytes = new Uint8Array(mel.buffer, mel.byteOffset, mel.byteLength);
+    const ptr = (__alloc(4 + melBytes.length) >>> 0);
+    new DataView(memory.buffer).setInt32(ptr, melBytes.length, true);
+    new Uint8Array(memory.buffer).set(melBytes, ptr + 4);
+
+    const frames = mel.length / 80;
     const maxNew = parseInt($('maxnew').value, 10);
-    status(`Transcribing (${melFrames} frames, max ${maxNew} tokens)... this takes a while.`);
-    log(`Calling transcribe(model, mel, frames=${melFrames}, max=${maxNew})`);
+    status(`transcribing (${frames} frames, max ${maxNew} tokens)... this takes a while.`);
+    log(`transcribe(model, mel, frames=${frames}, max=${maxNew})`);
+    await new Promise((r) => setTimeout(r, 50)); // let UI repaint
 
-    const t2 = performance.now();
-    // Yield to repaint so the status shows.
-    await new Promise((r) => setTimeout(r, 50));
-    const resultPtr = transcribe(modelPtr, melPtr, BigInt(melFrames), BigInt(maxNew));
-    const elapsed = performance.now() - t2;
-    const text = unwrapResultString(resultPtr);
+    const t1 = performance.now();
+    const langId = parseInt($('lang').value, 10);
+    const resultPtr = transcribe(modelPtr, ptr, BigInt(frames), BigInt(maxNew), BigInt(langId));
+    const elapsed = performance.now() - t1;
 
-    log(`transcribe returned in ${(elapsed / 1000).toFixed(1)} s`);
+    const view = new DataView(memory.buffer);
+    const tag = view.getInt32(resultPtr >>> 0, true);
+    const payload = (view.getInt32((resultPtr >>> 0) + 4, true) >>> 0);
+    const len = view.getInt32(payload, true);
+    const text = new TextDecoder().decode(new Uint8Array(memory.buffer, payload + 4, len));
+    if (tag !== 0) throw new Error('Almide returned Err: ' + text);
+
+    log(`transcribe done in ${(elapsed / 1000).toFixed(1)} s`);
     status(`Done in ${(elapsed / 1000).toFixed(1)} s.`);
     $('result').innerHTML = `<div class="result">${text}</div>`;
   } catch (err) {

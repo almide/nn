@@ -54,7 +54,7 @@ fn split_heads(m: Matrix, n_heads: Int) -> List[Matrix] =
   matrix.split_cols_even(m, n_heads)
 
 fn concat_heads(heads: List[Matrix]) -> Matrix =
-  matrix.concat_cols_many(heads)
+  matrix.concat_cols(heads)
 
 fn multi_head_attention(
   q_in: Matrix, k_in: Matrix, v_in: Matrix,

@@ -12,6 +12,7 @@ import self.whisper as w
 import self.generate as gen
 import self.transformer as tf
 import self.activations as act
+import self.mel as mel_mod
 
 fn whisper_tiny_en_config() -> w.WhisperConfig = {
   n_mels: 80,
@@ -44,10 +45,36 @@ fn decode_content(ids: List[Int], vocab: List[String]) -> String =
     |> list.map((tid) => list.get(vocab, tid) |> option.unwrap_or(""))
     |> list.join("")
 
-// Main entry — JS host computes mel spectrogram (Almide-side mel exhausts
-// WASM heap due to per-frame List allocations) and passes it as a flat
+// Probe: return the vocab token at the given index (for verifying language IDs).
+effect fn token_at(model_bytes: Bytes, idx: Int) -> String = {
+  let model = gw.parse(model_bytes)!
+  let vocab = gw.vocab_all(model)
+  list.get(vocab, idx) |> option.unwrap_or("?")
+}
+
+// Expose Whisper's pre-shipped 80×201 mel filterbank from the GGML model so
+// JS hosts can compute log-mel spectrograms client-side. (Computing mel inside
+// WASM exhausts the bump heap — per-frame List allocations balloon past 4 GB.)
+// Returns a flat f64 LE byte buffer of shape (n_mels, 1 + n_fft/2) = (80, 201).
+effect fn get_mel_filters(model_bytes: Bytes) -> Bytes = {
+  let model = gw.parse(model_bytes)!
+  let filters = wl.load_mel_filters(model)
+  var buf = bytes.new(0)
+  for row in filters {
+    for v in row {
+      bytes.append_f64_le(buf, v)
+    }
+  }
+  buf
+}
+
+// Main entry — JS host computes mel spectrogram and passes it as a flat
 // f64 LE byte buffer of shape (mel_frames, 80).
-effect fn transcribe(model_bytes: Bytes, mel_bytes: Bytes, mel_frames: Int, max_new: Int) -> String = {
+//
+// `lang_id` is a Whisper language token (50258=en, 50266=ja, 50260=de, …).
+// Pass 0 to use the legacy English-only prefix `[<|sot|>, <|transcribe|>,
+// <|notimestamps|>]` — needed for ggml-tiny.en.bin which lacks language tags.
+effect fn transcribe(model_bytes: Bytes, mel_bytes: Bytes, mel_frames: Int, max_new: Int, lang_id: Int) -> String = {
   // 1. Parse GGML model
   let model = gw.parse(model_bytes)!
   let vocab = gw.vocab_all(model)
@@ -74,7 +101,11 @@ effect fn transcribe(model_bytes: Bytes, mel_bytes: Bytes, mel_frames: Int, max_
   let encoder_out = act.layer_norm(encoded, weights.encoder_ln_gamma, weights.encoder_ln_beta)
 
   // 5. Decode
-  let prefix = [50257, 50358, 50362]
+  // Multilingual prefix: <|sot|>, <|lang|>, <|transcribe|>, <|notimestamps|>
+  // English-only models use the 3-token legacy prefix instead.
+  let prefix =
+    if lang_id == 0 then [50257, 50358, 50362]
+    else [50257, lang_id, 50358, 50362]
   let dec_pos = wl.load_decoder_pos_embed(model, config.d_model, config.n_text_ctx)
   let suppress: List[Int] = []
   let token_ids = gen.greedy_generate_with_pos(

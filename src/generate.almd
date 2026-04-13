@@ -30,7 +30,7 @@ fn project(hidden_last: List[Float], embedding: Matrix) -> List[Float] =
   // Compute logits[i] = embedding[i] · hidden_last using native row-dot.
   // Avoids materialising the entire embedding as List[List[Float]].
   list.map(list.range(0, matrix.rows(embedding)), (i) =>
-    matrix.row_dot(embedding, i, hidden_last))
+    matrix.dot_row(embedding, i, hidden_last))
 
 // ── One decoding step ──
 //
