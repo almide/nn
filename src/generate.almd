@@ -11,15 +11,14 @@ import self.transformer as tf
 
 // ── argmax over a vector of logits ──
 
-fn argmax(logits: List[Float]) -> Int = {
-  let best = list.enumerate(logits)
+fn argmax(logits: List[Float]) -> Int =
+  list.enumerate(logits)
     |> list.fold((0, -1.0e308), (acc, entry) => {
       let (best_i, best_v) = acc
       let (i, v) = entry
       if v > best_v then (i, v) else (best_i, best_v)
     })
-  best.0
-}
+    |> ((pair: (Int, Float)) => pair.0)
 
 // ── Project decoder hidden state to logits ──
 //

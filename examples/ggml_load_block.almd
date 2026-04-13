@@ -1,0 +1,47 @@
+// Verify every tensor in encoder block 0 can be located and its first
+// value decoded. This proves the full path from GGML bytes → F16/F32
+// decode works for all the tensor types that make up an encoder block.
+
+import self.ggml_whisper as gw
+
+fn peek_first(model: gw.Model, tensor: gw.TensorMeta) -> Float =
+  match tensor.ftype {
+    0 => gw.read_f32_le(model.data, tensor.data_offset),
+    1 => gw.read_f16_le(model.data, tensor.data_offset),
+    _ => 0.0,
+  }
+
+fn show(model: gw.Model, name: String) -> () =
+  match gw.find_tensor(model.tensors, name) {
+    some(t) => {
+      let dims = t.dims |> list.map((d) => int.to_string(d)) |> list.join("x")
+      let v = peek_first(model, t)
+      println("  " + name + " [" + dims + "] first=" + float.to_string(v))
+    },
+    none => println("  " + name + ": NOT FOUND"),
+  }
+
+effect fn main() -> () = {
+  let model = gw.load("/tmp/whisper_demo/ggml-tiny.bin")!
+  println("=== encoder.blocks.0 — 15 real tensors ===")
+  show(model, "encoder.blocks.0.attn_ln.weight")
+  show(model, "encoder.blocks.0.attn_ln.bias")
+  show(model, "encoder.blocks.0.attn.query.weight")
+  show(model, "encoder.blocks.0.attn.query.bias")
+  show(model, "encoder.blocks.0.attn.key.weight")
+  show(model, "encoder.blocks.0.attn.value.weight")
+  show(model, "encoder.blocks.0.attn.value.bias")
+  show(model, "encoder.blocks.0.attn.out.weight")
+  show(model, "encoder.blocks.0.attn.out.bias")
+  show(model, "encoder.blocks.0.mlp_ln.weight")
+  show(model, "encoder.blocks.0.mlp_ln.bias")
+  show(model, "encoder.blocks.0.mlp.0.weight")
+  show(model, "encoder.blocks.0.mlp.0.bias")
+  show(model, "encoder.blocks.0.mlp.2.weight")
+  show(model, "encoder.blocks.0.mlp.2.bias")
+  println("=== decoder.blocks.0 — 3 sample tensors ===")
+  show(model, "decoder.blocks.0.attn.query.weight")
+  show(model, "decoder.blocks.0.cross_attn.query.weight")
+  show(model, "decoder.blocks.0.mlp.0.weight")
+  println("=== Loaded and decoded ===")
+}
