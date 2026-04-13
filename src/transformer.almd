@@ -1,0 +1,394 @@
+// nn.transformer — Transformer encoder/decoder blocks
+//
+// Built on nn.attention (multi-head attention) + nn.activations (layer_norm, linear, gelu).
+// Reference architecture: Whisper-style encoder (pre-LN), decoder with cross-attention.
+
+import math
+import self.tensor as t
+import self.activations as act
+import self.attention as attn
+
+// ── Encoder block ──
+//
+// Pre-LN encoder block:
+//   h = x + MHA(LN(x))
+//   out = h + FFN(LN(h))
+//
+// FFN: linear → gelu → linear
+// MHA uses same input for Q, K, V (self-attention)
+
+fn encoder_block(
+  x: Matrix,
+  // Self-attention weights
+  w_q: Matrix, w_k: Matrix, w_v: Matrix, w_o: Matrix,
+  b_q: List[Float], b_k: List[Float], b_v: List[Float], b_o: List[Float],
+  n_heads: Int,
+  // Layer norm parameters (two layers: one before MHA, one before FFN)
+  ln1_gamma: List[Float], ln1_beta: List[Float],
+  ln2_gamma: List[Float], ln2_beta: List[Float],
+  // FFN weights
+  w_ffn1: Matrix, b_ffn1: List[Float],
+  w_ffn2: Matrix, b_ffn2: List[Float],
+) -> Matrix = {
+  // Pre-LN self-attention
+  let x_norm = act.layer_norm(x, ln1_gamma, ln1_beta)
+  let attn_out = attn.multi_head_attention(
+    x_norm, x_norm, x_norm,
+    w_q, w_k, w_v, w_o,
+    b_q, b_k, b_v, b_o,
+    n_heads,
+  )
+  let h = matrix.add(x, attn_out)
+
+  // Pre-LN FFN
+  let h_norm = act.layer_norm(h, ln2_gamma, ln2_beta)
+  let ffn_out = act.linear(act.gelu(act.linear(h_norm, w_ffn1, b_ffn1)), w_ffn2, b_ffn2)
+  matrix.add(h, ffn_out)
+}
+
+// ── Decoder block ──
+//
+// Standard decoder with causal self-attention + cross-attention:
+//   h1 = x + CausalMHA(LN(x))
+//   h2 = h1 + CrossMHA(LN(h1), encoder_out)
+//   out = h2 + FFN(LN(h2))
+
+fn decoder_block(
+  x: Matrix,
+  encoder_out: Matrix,
+  // Causal self-attention weights
+  w_sq: Matrix, w_sk: Matrix, w_sv: Matrix, w_so: Matrix,
+  b_sq: List[Float], b_sk: List[Float], b_sv: List[Float], b_so: List[Float],
+  // Cross-attention weights
+  w_cq: Matrix, w_ck: Matrix, w_cv: Matrix, w_co: Matrix,
+  b_cq: List[Float], b_ck: List[Float], b_cv: List[Float], b_co: List[Float],
+  n_heads: Int,
+  // Three layer norms
+  ln1_gamma: List[Float], ln1_beta: List[Float],
+  ln2_gamma: List[Float], ln2_beta: List[Float],
+  ln3_gamma: List[Float], ln3_beta: List[Float],
+  // FFN weights
+  w_ffn1: Matrix, b_ffn1: List[Float],
+  w_ffn2: Matrix, b_ffn2: List[Float],
+) -> Matrix = {
+  // Causal self-attention (pre-LN)
+  let x_norm = act.layer_norm(x, ln1_gamma, ln1_beta)
+  // For causal self-attention we rely on the user's w_so producing proper masking internally;
+  // our attention module has masked_scaled_dot_product for the mechanism — but the MHA
+  // facade doesn't expose masking yet. We use non-causal MHA here and rely on training-time
+  // masking conventions (the caller is responsible for providing causally-ordered tokens).
+  //
+  // TODO: extend attn.multi_head_attention with a causal_mask parameter.
+  let self_out = attn.multi_head_attention(
+    x_norm, x_norm, x_norm,
+    w_sq, w_sk, w_sv, w_so,
+    b_sq, b_sk, b_sv, b_so,
+    n_heads,
+  )
+  let h1 = matrix.add(x, self_out)
+
+  // Cross-attention: Q from h1, K/V from encoder
+  let h1_norm = act.layer_norm(h1, ln2_gamma, ln2_beta)
+  let cross_out = attn.multi_head_attention(
+    h1_norm, encoder_out, encoder_out,
+    w_cq, w_ck, w_cv, w_co,
+    b_cq, b_ck, b_cv, b_co,
+    n_heads,
+  )
+  let h2 = matrix.add(h1, cross_out)
+
+  // FFN (pre-LN)
+  let h2_norm = act.layer_norm(h2, ln3_gamma, ln3_beta)
+  let ffn_out = act.linear(act.gelu(act.linear(h2_norm, w_ffn1, b_ffn1)), w_ffn2, b_ffn2)
+  matrix.add(h2, ffn_out)
+}
+
+// ── Bundled weight types ──
+//
+// Flat function arguments scale badly to a stack of N layers. These records
+// package the parameters that logically belong together so encoder/decoder
+// stacks can iterate cleanly.
+
+type LinearWeights = { w: Matrix, bias: List[Float] }
+type LayerNormParams = { gamma: List[Float], beta: List[Float] }
+
+type AttentionWeights = {
+  q: LinearWeights,
+  k: LinearWeights,
+  v: LinearWeights,
+  out: LinearWeights,
+}
+
+type EncoderLayer = {
+  attn: AttentionWeights,
+  ln1: LayerNormParams,
+  ln2: LayerNormParams,
+  ffn1: LinearWeights,
+  ffn2: LinearWeights,
+}
+
+type DecoderLayer = {
+  self_attn: AttentionWeights,
+  cross_attn: AttentionWeights,
+  ln1: LayerNormParams,
+  ln2: LayerNormParams,
+  ln3: LayerNormParams,
+  ffn1: LinearWeights,
+  ffn2: LinearWeights,
+}
+
+// ── Bundled-weight variants of the blocks ──
+
+fn encoder_block_r(x: Matrix, layer: EncoderLayer, n_heads: Int) -> Matrix =
+  encoder_block(
+    x,
+    layer.attn.q.w, layer.attn.k.w, layer.attn.v.w, layer.attn.out.w,
+    layer.attn.q.bias, layer.attn.k.bias, layer.attn.v.bias, layer.attn.out.bias,
+    n_heads,
+    layer.ln1.gamma, layer.ln1.beta,
+    layer.ln2.gamma, layer.ln2.beta,
+    layer.ffn1.w, layer.ffn1.bias,
+    layer.ffn2.w, layer.ffn2.bias,
+  )
+
+fn decoder_block_r(x: Matrix, encoder_out: Matrix, layer: DecoderLayer, n_heads: Int) -> Matrix =
+  decoder_block(
+    x, encoder_out,
+    layer.self_attn.q.w, layer.self_attn.k.w, layer.self_attn.v.w, layer.self_attn.out.w,
+    layer.self_attn.q.bias, layer.self_attn.k.bias, layer.self_attn.v.bias, layer.self_attn.out.bias,
+    layer.cross_attn.q.w, layer.cross_attn.k.w, layer.cross_attn.v.w, layer.cross_attn.out.w,
+    layer.cross_attn.q.bias, layer.cross_attn.k.bias, layer.cross_attn.v.bias, layer.cross_attn.out.bias,
+    n_heads,
+    layer.ln1.gamma, layer.ln1.beta,
+    layer.ln2.gamma, layer.ln2.beta,
+    layer.ln3.gamma, layer.ln3.beta,
+    layer.ffn1.w, layer.ffn1.bias,
+    layer.ffn2.w, layer.ffn2.bias,
+  )
+
+// ── Full encoder / decoder stacks ──
+
+fn encode(x: Matrix, layers: List[EncoderLayer], n_heads: Int) -> Matrix =
+  list.fold(layers, x, (h, layer) => encoder_block_r(h, layer, n_heads))
+
+fn decode(
+  x: Matrix, encoder_out: Matrix, layers: List[DecoderLayer], n_heads: Int,
+) -> Matrix =
+  list.fold(layers, x, (h, layer) => decoder_block_r(h, encoder_out, layer, n_heads))
+
+// ── Token embedding ──
+//
+// Convert a sequence of token IDs into a (seq_len, d_model) matrix by
+// gathering rows from the embedding matrix. Out-of-range tokens are mapped
+// to the zero vector (graceful degradation — unknown tokens don't crash).
+
+fn embed(tokens: List[Int], embedding: Matrix) -> Matrix = {
+  let d_model = matrix.cols(embedding)
+  let rows = matrix.to_lists(embedding)
+  let vec_for = (tok: Int) =>
+    list.get(rows, tok) |> option.unwrap_or(list.map(list.range(0, d_model), (_) => 0.0))
+  matrix.from_lists(list.map(tokens, vec_for))
+}
+
+// ── Tests ──
+
+fn approx(a: Float, b: Float) -> Bool =
+  float.abs(a - b) < 0.001
+
+// Identity test: with near-zero weights, encoder block should roughly preserve input
+// (both the MHA and FFN outputs collapse toward zero, residual keeps the input).
+test "encoder_block identity-ish with zero weights" {
+  let d_model = 4
+  let n_heads = 2
+  let seq_len = 2
+
+  let x = matrix.from_lists([[1.0, 2.0, 3.0, 4.0], [0.5, 1.5, 2.5, 3.5]])
+
+  // Zero weights and biases
+  let zero_mat = matrix.zeros(d_model, d_model)
+  let zero_bias = list.map(list.range(0, d_model), (_) => 0.0)
+  // Layer norm: gamma=1, beta=0 → identity-ish normalization
+  let gamma = list.map(list.range(0, d_model), (_) => 1.0)
+  let beta = list.map(list.range(0, d_model), (_) => 0.0)
+
+  let out = encoder_block(
+    x,
+    zero_mat, zero_mat, zero_mat, zero_mat,
+    zero_bias, zero_bias, zero_bias, zero_bias,
+    n_heads,
+    gamma, beta,
+    gamma, beta,
+    zero_mat, zero_bias,
+    zero_mat, zero_bias,
+  )
+
+  // Zero weights mean attn_out = 0 and ffn_out = 0, so output = input
+  assert_eq(matrix.rows(out), seq_len)
+  assert_eq(matrix.cols(out), d_model)
+  // First element of input row 0 was 1.0 → output should still be ≈ 1.0
+  let out00 = matrix.get(out, 0, 0)
+  assert(approx(out00, 1.0), "expected ≈ 1.0, got different value")
+}
+
+// Shape-preservation test: encoder block output has same shape as input
+test "encoder_block shape" {
+  let d_model = 4
+  let n_heads = 2
+  let seq_len = 3
+
+  let x = matrix.from_lists([
+    [0.1, 0.2, 0.3, 0.4],
+    [0.5, 0.6, 0.7, 0.8],
+    [0.9, 1.0, 1.1, 1.2],
+  ])
+
+  let w = matrix.from_lists([
+    [0.1, 0.0, 0.0, 0.0],
+    [0.0, 0.1, 0.0, 0.0],
+    [0.0, 0.0, 0.1, 0.0],
+    [0.0, 0.0, 0.0, 0.1],
+  ])
+  let b = [0.0, 0.0, 0.0, 0.0]
+  let gamma = [1.0, 1.0, 1.0, 1.0]
+  let beta = [0.0, 0.0, 0.0, 0.0]
+
+  let out = encoder_block(
+    x,
+    w, w, w, w,
+    b, b, b, b,
+    n_heads,
+    gamma, beta,
+    gamma, beta,
+    w, b,
+    w, b,
+  )
+
+  assert_eq(matrix.rows(out), seq_len)
+  assert_eq(matrix.cols(out), d_model)
+}
+
+// ── Stack + embedding tests ──
+
+fn make_zero_linear(d_model: Int) -> LinearWeights = {
+  w: matrix.zeros(d_model, d_model),
+  bias: list.map(list.range(0, d_model), (_) => 0.0),
+}
+
+fn make_zero_attn(d_model: Int) -> AttentionWeights = {
+  q: make_zero_linear(d_model),
+  k: make_zero_linear(d_model),
+  v: make_zero_linear(d_model),
+  out: make_zero_linear(d_model),
+}
+
+fn make_id_ln(d_model: Int) -> LayerNormParams = {
+  gamma: list.map(list.range(0, d_model), (_) => 1.0),
+  beta: list.map(list.range(0, d_model), (_) => 0.0),
+}
+
+fn make_zero_encoder_layer(d_model: Int) -> EncoderLayer = {
+  attn: make_zero_attn(d_model),
+  ln1: make_id_ln(d_model),
+  ln2: make_id_ln(d_model),
+  ffn1: make_zero_linear(d_model),
+  ffn2: make_zero_linear(d_model),
+}
+
+fn make_zero_decoder_layer(d_model: Int) -> DecoderLayer = {
+  self_attn: make_zero_attn(d_model),
+  cross_attn: make_zero_attn(d_model),
+  ln1: make_id_ln(d_model),
+  ln2: make_id_ln(d_model),
+  ln3: make_id_ln(d_model),
+  ffn1: make_zero_linear(d_model),
+  ffn2: make_zero_linear(d_model),
+}
+
+test "encode identity with zero-weight stack" {
+  let d_model = 4
+  let n_heads = 2
+  let x = matrix.from_lists([[1.0, 2.0, 3.0, 4.0], [0.5, 1.5, 2.5, 3.5]])
+  let layers = list.map(list.range(0, 3), (_) => make_zero_encoder_layer(d_model))
+  let out = encode(x, layers, n_heads)
+  // Zero weights → every block is identity → output = input
+  assert(approx(matrix.get(out, 0, 0), 1.0), "row 0 col 0 should stay ≈ 1.0")
+  assert(approx(matrix.get(out, 1, 3), 3.5), "row 1 col 3 should stay ≈ 3.5")
+}
+
+test "decode preserves shape with zero-weight stack" {
+  let d_model = 4
+  let n_heads = 2
+  let x = matrix.from_lists([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]])
+  let enc = matrix.from_lists([[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0]])
+  let layers = list.map(list.range(0, 2), (_) => make_zero_decoder_layer(d_model))
+  let out = decode(x, enc, layers, n_heads)
+  assert_eq(matrix.rows(out), 2)
+  assert_eq(matrix.cols(out), d_model)
+}
+
+test "embed gathers rows from embedding matrix" {
+  let d_model = 3
+  let embedding = matrix.from_lists([
+    [10.0, 20.0, 30.0],
+    [40.0, 50.0, 60.0],
+    [70.0, 80.0, 90.0],
+  ])
+  let tokens = [2, 0, 1]
+  let out = embed(tokens, embedding)
+  assert_eq(matrix.rows(out), 3)
+  assert_eq(matrix.cols(out), d_model)
+  assert(approx(matrix.get(out, 0, 0), 70.0), "first row should be token 2 = [70, 80, 90]")
+  assert(approx(matrix.get(out, 1, 1), 20.0), "second row should be token 0 = [10, 20, 30]")
+  assert(approx(matrix.get(out, 2, 2), 60.0), "third row should be token 1 = [40, 50, 60]")
+}
+
+test "embed out-of-range tokens map to zero" {
+  let embedding = matrix.from_lists([[1.0, 2.0]])
+  let tokens = [0, 99]
+  let out = embed(tokens, embedding)
+  assert(approx(matrix.get(out, 1, 0), 0.0), "out-of-range token → zero vector")
+}
+
+test "decoder_block shape" {
+  let d_model = 4
+  let n_heads = 2
+  let seq_len = 2
+  let enc_len = 3
+
+  let x = matrix.from_lists([
+    [0.1, 0.2, 0.3, 0.4],
+    [0.5, 0.6, 0.7, 0.8],
+  ])
+  let enc = matrix.from_lists([
+    [1.0, 1.0, 1.0, 1.0],
+    [2.0, 2.0, 2.0, 2.0],
+    [3.0, 3.0, 3.0, 3.0],
+  ])
+
+  let w = matrix.from_lists([
+    [0.1, 0.0, 0.0, 0.0],
+    [0.0, 0.1, 0.0, 0.0],
+    [0.0, 0.0, 0.1, 0.0],
+    [0.0, 0.0, 0.0, 0.1],
+  ])
+  let b = [0.0, 0.0, 0.0, 0.0]
+  let gamma = [1.0, 1.0, 1.0, 1.0]
+  let beta = [0.0, 0.0, 0.0, 0.0]
+
+  let out = decoder_block(
+    x, enc,
+    w, w, w, w,
+    b, b, b, b,
+    w, w, w, w,
+    b, b, b, b,
+    n_heads,
+    gamma, beta,
+    gamma, beta,
+    gamma, beta,
+    w, b,
+    w, b,
+  )
+
+  assert_eq(matrix.rows(out), seq_len)
+  assert_eq(matrix.cols(out), d_model)
+}

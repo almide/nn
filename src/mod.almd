@@ -7,6 +7,7 @@
 //   nn.activations  Activation functions (relu, gelu, softmax, sigmoid, tanh)
 //                   Layer normalization, linear layer
 //   nn.attention    Scaled dot-product attention, multi-head attention
+//   nn.transformer  Encoder / decoder blocks
 //
 // Usage:
 //   import nn.tensor as t
