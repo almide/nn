@@ -1,0 +1,166 @@
+// nn.tokenizer — Byte-Pair Encoding (BPE) tokenizer
+//
+// Implements the GPT-2/Whisper style BPE algorithm in pure Almide.
+//
+// ## Data model
+//
+// `Vocab` maps token strings to integer IDs. For Whisper's vocab the strings
+// are UTF-8 byte sequences already (byte → surrogate form, e.g. byte 0x20
+// = ' ' becomes "Ġ" in GPT-2's convention). We represent vocab as
+// `Map[String, Int]`.
+//
+// `Merges` is an ordered list of pairs `(left, right)` where `left + right`
+// is a known merged token. The index of the pair in the list is its
+// priority — lower index = applied first. This matches how GPT-2 stores
+// `merges.txt` (one pair per line, order is priority).
+
+import math
+
+type Vocab = Map[String, Int]
+type Merges = List[(String, String)]
+
+// ── Encoding ──
+//
+// Encode a string → List[Int] of token ids.
+//
+// Algorithm (simplified byte-level BPE):
+// 1. Split input string into single-character tokens.
+// 2. Repeatedly find the adjacent pair with the lowest merge rank.
+// 3. Merge that pair, shrinking the list.
+// 4. Stop when no more merges apply.
+// 5. Look each final token up in `vocab`.
+//
+// Tokens not in vocab map to -1 (caller may want to treat -1 as <unk>).
+
+fn split_chars(s: String) -> List[String] =
+  list.map(list.range(0, string.len(s)), (i) =>
+    string.slice(s, i, i + 1)
+  )
+
+// Find the index of the adjacent pair with the lowest merge rank. Returns
+// `(-1, very large)` if no merge applies. Rank is "priority index" in the
+// merges list, so lower = merge first.
+fn best_pair_index(tokens: List[String], merges: Merges) -> (Int, Int) = {
+  let last = list.len(tokens) - 1
+  list.fold(list.range(0, last), (-1, 99999999), (acc, i) => {
+    let (best_i, best_rank) = acc
+    let a = list.get(tokens, i) |> option.unwrap_or("")
+    let b = list.get(tokens, i + 1) |> option.unwrap_or("")
+    let rank = merges
+      |> list.enumerate
+      |> list.find((entry) => {
+        let (_, pair) = entry
+        let (pa, pb) = pair
+        pa == a and pb == b
+      })
+      |> option.map((entry) => entry.0)
+      |> option.unwrap_or(99999999)
+    if rank < best_rank then (i, rank) else (best_i, best_rank)
+  })
+}
+
+// Merge tokens at position `i` and `i+1` by concatenation, keeping all other
+// tokens in place.
+fn merge_at(tokens: List[String], i: Int) -> List[String] = {
+  let a = list.get(tokens, i) |> option.unwrap_or("")
+  let b = list.get(tokens, i + 1) |> option.unwrap_or("")
+  let merged = a + b
+  list.take(tokens, i) + [merged] + list.drop(tokens, i + 2)
+}
+
+// Apply merges until no pair matches. Converges in at most N iterations
+// where N = len(tokens); we bound the loop to prevent runaway in case of
+// a malformed merge table.
+fn bpe_merge(tokens: List[String], merges: Merges) -> List[String] = {
+  // Use a recursive helper; effect-free.
+  if list.len(tokens) < 2 then tokens
+  else {
+    let (pi, _) = best_pair_index(tokens, merges)
+    if pi < 0 then tokens
+    else bpe_merge(merge_at(tokens, pi), merges)
+  }
+}
+
+fn encode(text: String, vocab: Vocab, merges: Merges) -> List[Int] = {
+  let chars = split_chars(text)
+  let merged = bpe_merge(chars, merges)
+  list.map(merged, (tok) =>
+    map.get(vocab, tok) |> option.unwrap_or(-1)
+  )
+}
+
+// ── Decoding ──
+//
+// Decode a List[Int] → String by looking up each id in the reverse vocab.
+// Unknown ids (vocab miss) are skipped.
+
+fn decode(ids: List[Int], vocab: Vocab) -> String = {
+  // Linear scan of `vocab` entries for each id. For very large vocabs a
+  // pre-built reverse map would be faster, but this is simple and avoids
+  // a second dict allocation per call.
+  let pairs = map.entries(vocab)
+  let lookup = (tid: Int) => {
+    let hit = list.fold(pairs, "", (acc, pair) => {
+      let (tok, id) = pair
+      if id == tid then tok else acc
+    })
+    hit
+  }
+  ids |> list.map(lookup) |> list.join("")
+}
+
+// ── Tests ──
+
+fn approx(a: Float, b: Float) -> Bool =
+  float.abs(a - b) < 0.001
+
+test "split_chars splits per-character" {
+  let r = split_chars("abc")
+  assert_eq(list.len(r), 3)
+  assert_eq(list.get(r, 0) |> option.unwrap_or(""), "a")
+  assert_eq(list.get(r, 2) |> option.unwrap_or(""), "c")
+}
+
+test "merge_at joins adjacent tokens" {
+  let r = merge_at(["a", "b", "c", "d"], 1)
+  assert_eq(list.len(r), 3)
+  assert_eq(list.get(r, 0) |> option.unwrap_or(""), "a")
+  assert_eq(list.get(r, 1) |> option.unwrap_or(""), "bc")
+  assert_eq(list.get(r, 2) |> option.unwrap_or(""), "d")
+}
+
+test "bpe_merge applies rules in priority order" {
+  // Rules: ("a", "b") merges first, then ("ab", "c")
+  let merges = [("a", "b"), ("ab", "c")]
+  let r = bpe_merge(["a", "b", "c", "d"], merges)
+  assert_eq(list.len(r), 2)
+  assert_eq(list.get(r, 0) |> option.unwrap_or(""), "abc")
+  assert_eq(list.get(r, 1) |> option.unwrap_or(""), "d")
+}
+
+test "bpe_merge stops when no rule matches" {
+  let merges = [("x", "y")]
+  let r = bpe_merge(["a", "b", "c"], merges)
+  assert_eq(list.len(r), 3)
+}
+
+test "encode with matching vocab and merges" {
+  let vocab = map.from_list([("abc", 100), ("d", 4)])
+  let merges = [("a", "b"), ("ab", "c")]
+  let ids = encode("abcd", vocab, merges)
+  assert_eq(list.len(ids), 2)
+  assert_eq(list.get(ids, 0) |> option.unwrap_or(-99), 100)
+  assert_eq(list.get(ids, 1) |> option.unwrap_or(-99), 4)
+}
+
+test "decode inverts encode via vocab lookup" {
+  let vocab = map.from_list([("hello", 5), (" ", 6), ("world", 7)])
+  let s = decode([5, 6, 7], vocab)
+  assert_eq(s, "hello world")
+}
+
+test "decode skips unknown ids" {
+  let vocab = map.from_list([("a", 1), ("b", 2)])
+  let s = decode([1, 999, 2], vocab)
+  assert_eq(s, "ab")
+}

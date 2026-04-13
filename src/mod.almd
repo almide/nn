@@ -8,6 +8,8 @@
 //                   Layer normalization, linear layer
 //   nn.attention    Scaled dot-product attention, multi-head attention
 //   nn.transformer  Encoder / decoder blocks
+//   nn.tokenizer    BPE encode / decode
+//   nn.generate     Greedy decoding (argmax loop + projection)
 //
 // Usage:
 //   import nn.tensor as t
