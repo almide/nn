@@ -1,0 +1,49 @@
+// Whisper end-to-end demo: load a WAV, run the full transcribe pipeline.
+//
+// Uses synthetic zero weights (real transcription would need a Whisper GGML
+// parser, which is separate work). The point here is to exercise every
+// stage — wav.read → mel → encoder → decoder → greedy decode → tokenizer.
+
+import self.wav as wav
+import self.mel as mel
+import self.transformer as tf
+import self.generate as gen
+import self.tokenizer as tok
+import self.whisper as w
+
+effect fn main() -> () = {
+  // 1. Load a real WAV file
+  let path = "/tmp/whisper_demo/sine_440.wav"
+  let audio = wav.load(path)!
+  println("loaded WAV: " + int.to_string(list.len(audio.samples)) + " samples @ " + int.to_string(audio.info.sample_rate) + " Hz")
+
+  // 2. Configure the model (tiny-test dimensions for synthetic weights)
+  let config = w.test_config()
+
+  // 3. Build synthetic weights
+  let vocab_size = 8
+  let n_layers = 1
+  let weights = w.zero_weights(config, vocab_size, n_layers, n_layers)
+  println("built zero-weight model (d_model=" + int.to_string(config.d_model) + ", n_heads=" + int.to_string(config.n_heads) + ")")
+
+  // 4. Run encoder independently to show it works on real audio features
+  let mel_mat = w.audio_to_mel(audio.samples, config)
+  println("mel spectrogram: " + int.to_string(matrix.rows(mel_mat)) + " x " + int.to_string(matrix.cols(mel_mat)))
+
+  let encoded = w.encode_audio(mel_mat, weights, config)
+  println("encoder output: " + int.to_string(matrix.rows(encoded)) + " x " + int.to_string(matrix.cols(encoded)))
+
+  // 5. Full transcribe with a tiny vocab
+  let vocab = map.from_list([
+    ("<eot>", 0),
+    ("<sot>", 1),
+    ("hello", 2),
+    ("world", 3),
+    (".", 4),
+    (" ", 5),
+    ("test", 6),
+    ("audio", 7),
+  ])
+  let text = w.transcribe(audio.samples, weights, config, vocab, 3)
+  println("transcribe output: \"" + text + "\"")
+}
