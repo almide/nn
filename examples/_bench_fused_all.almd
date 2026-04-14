@@ -1,0 +1,69 @@
+// Comprehensive fused bench: Almide vs NumPy across 3..1024, both f32 and f64.
+import env
+
+effect fn bf32(n: Int, iters: Int) -> () = {
+  let a = matrix.ones_f32(n, n) |> (m) => matrix.scale(m, 0.001)
+  let b = matrix.ones_f32(n, n) |> (m) => matrix.scale(m, 0.001)
+  let _w = matrix.get(matrix.mul_f32_scaled(a, 1.0, b), 0, 0)
+  let t0 = env.millis()
+  var i = 0
+  var acc = 0.0
+  while i < iters {
+    let eps = 1.0 + int.to_float(i) * 0.000000001
+    let r = matrix.mul_f32_scaled(a, eps, b)
+    acc = acc + matrix.get(r, 0, 0)
+    i = i + 1
+  }
+  let el = env.millis() - t0
+  let usc = int.to_float(el) * 1000.0 / int.to_float(iters)
+  let tf = 2 * n * n * n
+  let gflops = int.to_float(tf * iters) / (int.to_float(el) / 1000.0) / 1e9
+  println("f32 " + int.to_string(n) + "²: " + int.to_string(el) + "ms " + float.to_string(gflops) + "GF " + float.to_string(usc) + "µs/call")
+}
+
+effect fn bf64(n: Int, iters: Int) -> () = {
+  let a = matrix.ones(n, n) |> (m) => matrix.scale(m, 0.001)
+  let b = matrix.ones(n, n) |> (m) => matrix.scale(m, 0.001)
+  let _w = matrix.get(matrix.mul_scaled(a, 1.0, b), 0, 0)
+  let t0 = env.millis()
+  var i = 0
+  var acc = 0.0
+  while i < iters {
+    let eps = 1.0 + int.to_float(i) * 0.000000001
+    let r = matrix.mul_scaled(a, eps, b)
+    acc = acc + matrix.get(r, 0, 0)
+    i = i + 1
+  }
+  let el = env.millis() - t0
+  let usc = int.to_float(el) * 1000.0 / int.to_float(iters)
+  let tf = 2 * n * n * n
+  let gflops = int.to_float(tf * iters) / (int.to_float(el) / 1000.0) / 1e9
+  println("f64 " + int.to_string(n) + "²: " + int.to_string(el) + "ms " + float.to_string(gflops) + "GF " + float.to_string(usc) + "µs/call")
+}
+
+effect fn main() -> () = {
+  println("=== FUSED f32 ===")
+  bf32(3, 5000000)
+  bf32(8, 2000000)
+  bf32(16, 1000000)
+  bf32(32, 300000)
+  bf32(64, 100000)
+  bf32(128, 20000)
+  bf32(256, 5000)
+  bf32(384, 2000)
+  bf32(512, 1000)
+  bf32(768, 400)
+  bf32(1024, 200)
+  println("=== FUSED f64 ===")
+  bf64(3, 5000000)
+  bf64(8, 2000000)
+  bf64(16, 500000)
+  bf64(32, 300000)
+  bf64(64, 100000)
+  bf64(128, 20000)
+  bf64(256, 5000)
+  bf64(384, 2000)
+  bf64(512, 1000)
+  bf64(768, 400)
+  bf64(1024, 200)
+}

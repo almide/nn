@@ -1,0 +1,35 @@
+// Fused scale+mul via cblas_sgemm alpha. Eliminates intermediate Vec<f32>
+// allocation that plagues the unfused bench at 256-512².
+import env
+
+effect fn bench(label: String, n: Int, iters: Int) -> () = {
+  let a = matrix.ones_f32(n, n) |> (m) => matrix.scale(m, 0.001)
+  let b = matrix.ones_f32(n, n) |> (m) => matrix.scale(m, 0.001)
+  let _w = matrix.get(matrix.mul_f32_scaled(a, 1.0, b), 0, 0)
+  let t0 = env.millis()
+  var i = 0
+  var acc = 0.0
+  while i < iters {
+    let eps = 1.0 + int.to_float(i) * 0.000000001
+    // Fused: single sgemm call with alpha = eps. No scale alloc.
+    let r = matrix.mul_f32_scaled(a, eps, b)
+    acc = acc + matrix.get(r, 0, 0)
+    i = i + 1
+  }
+  let el = env.millis() - t0
+  let tf = 2 * n * n * n
+  let gflops = int.to_float(tf * iters) / (int.to_float(el) / 1000.0) / 1e9
+  let usc = int.to_float(el) * 1000.0 / int.to_float(iters)
+  println(label + " " + int.to_string(n) + "² iter=" + int.to_string(iters) + ": " + int.to_string(el) + "ms " + float.to_string(gflops) + " GFLOPS " + float.to_string(usc) + "µs/call (acc=" + float.to_string(acc) + ")")
+}
+
+effect fn main() -> () = {
+  println("Almide f32 FUSED matmul (mul_f32_scaled): no intermediate alloc")
+  // Higher iters for ms-precision timers (each size targets 500+ ms total)
+  bench("sq", 128, 20000)
+  bench("sq", 256, 5000)
+  bench("sq", 384, 2000)
+  bench("sq", 512, 1000)
+  bench("sq", 768, 400)
+  bench("sq", 1024, 200)
+}
