@@ -1,0 +1,30 @@
+import env
+
+effect fn bench(n: Int, iters: Int) -> () = {
+  let a = matrix.ones_f32(n, n) |> (m) => matrix.scale(m, 0.001)
+  let b = matrix.ones_f32(n, n) |> (m) => matrix.scale(m, 0.001)
+  let _w = matrix.get(matrix.mul_f32(a, b), 0, 0)
+  let t0 = env.millis()
+  var i = 0
+  var acc = 0.0
+  while i < iters {
+    let eps = 1.0 + int.to_float(i) * 0.000000001
+    let ai = matrix.scale(a, eps)
+    let r = matrix.mul_f32(ai, b)
+    acc = acc + matrix.get(r, 0, 0)
+    i = i + 1
+  }
+  let el = env.millis() - t0
+  let usc = int.to_float(el) * 1000.0 / int.to_float(iters)
+  let tf = 2 * n * n * n
+  let gflops = int.to_float(tf * iters) / (int.to_float(el) / 1000.0) / 1e9
+  println(int.to_string(n) + "²: " + int.to_string(el) + "ms " + float.to_string(gflops) + " GFLOPS " + float.to_string(usc) + "µs/call")
+}
+
+effect fn main() -> () = {
+  bench(3, 100000)
+  bench(8, 100000)
+  bench(16, 100000)
+  bench(32, 10000)
+  bench(64, 10000)
+}
