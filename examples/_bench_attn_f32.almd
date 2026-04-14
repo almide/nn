@@ -1,0 +1,50 @@
+// Full attention block in pure f32:
+//   x_ln = layer_norm(x)
+//   q = x_ln @ Wq; k = x_ln @ Wk; v = x_ln @ Wv
+//   scores = softmax(Q @ K^T / sqrt(d))
+//   out = scores @ V @ Wo
+import env
+
+effect fn bench(label: String, seq: Int, d: Int, iters: Int) -> () = {
+  let x  = matrix.ones_f32(seq, d) |> (m) => matrix.scale(m, 0.001)
+  let wq = matrix.ones_f32(d, d)   |> (m) => matrix.scale(m, 0.01)
+  let wk = matrix.ones_f32(d, d)   |> (m) => matrix.scale(m, 0.01)
+  let wv = matrix.ones_f32(d, d)   |> (m) => matrix.scale(m, 0.01)
+  let wo = matrix.ones_f32(d, d)   |> (m) => matrix.scale(m, 0.01)
+  let gamma: List[Float] = list.range(0, d) |> list.map((_) => 1.0)
+  let beta:  List[Float] = list.range(0, d) |> list.map((_) => 0.0)
+  let scale_factor = 1.0 / float.sqrt(int.to_float(d))
+  // warm
+  let _w = matrix.get(matrix.layer_norm_rows(x, gamma, beta, 0.00001), 0, 0)
+
+  let t0 = env.millis()
+  var i = 0
+  var acc = 0.0
+  while i < iters {
+    let eps_iter = 1.0 + int.to_float(i) * 0.000000001
+    let x_i  = matrix.scale(x, eps_iter)
+    let x_ln = matrix.layer_norm_rows(x_i, gamma, beta, 0.00001)
+    let q = matrix.mul_f32(x_ln, wq)
+    let k = matrix.mul_f32(x_ln, wk)
+    let v = matrix.mul_f32(x_ln, wv)
+    let scores = matrix.mul_f32_t_scaled(q, scale_factor, k)
+    let weights = matrix.softmax_rows(scores)
+    let attn = matrix.mul_f32(weights, v)
+    let out = matrix.mul_f32(attn, wo)
+    acc = acc + matrix.get(out, 0, 0)
+    i = i + 1
+  }
+  let el = env.millis() - t0
+  let usc = int.to_float(el) * 1000.0 / int.to_float(iters)
+  // 5 matmuls: QKV projections (3*seq*d²), scores (seq²*d), attn (seq*d*seq), out (seq*d²)
+  let mm = 3 * 2 * seq * d * d + 2 * seq * d * seq + 2 * seq * seq * d + 2 * seq * d * d
+  let gflops = int.to_float(mm * iters) / (int.to_float(el) / 1000.0) / 1e9
+  println(label + " seq=" + int.to_string(seq) + " d=" + int.to_string(d) + ": " + int.to_string(el) + "ms " + float.to_string(gflops) + "GF " + float.to_string(usc) + "µs/call (acc=" + float.to_string(acc) + ")")
+}
+
+effect fn main() -> () = {
+  println("Almide f32 full attention block (layer_norm + QKV + softmax + out)")
+  bench("whisper", 500, 384, 100)
+  bench("mid",     256, 512, 100)
+  bench("gpt",     128, 768, 200)
+}
