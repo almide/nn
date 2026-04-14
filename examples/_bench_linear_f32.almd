@@ -1,0 +1,38 @@
+// Realistic sci-compute: chained linear layers (y = X@W + b) in f32.
+// Exercises matmul + broadcast_add_row in pure SmallF32 path.
+import env
+
+effect fn bench(label: String, seq: Int, d: Int, iters: Int) -> () = {
+  // X: (seq, d), W: (d, d), b: (d,)
+  let x = matrix.ones_f32(seq, d) |> (m) => matrix.scale(m, 0.001)
+  let w1 = matrix.ones_f32(d, d) |> (m) => matrix.scale(m, 0.01)
+  let w2 = matrix.ones_f32(d, d) |> (m) => matrix.scale(m, 0.01)
+  let b1 = [0.1, 0.1, 0.1] |> list.map((_) => 0.1)  // Not actually used below
+  // Warm up
+  let _w = matrix.get(matrix.mul_f32(x, w1), 0, 0)
+
+  let t0 = env.millis()
+  var i = 0
+  var acc = 0.0
+  while i < iters {
+    let eps = 1.0 + int.to_float(i) * 0.000000001
+    let y = matrix.mul_f32_scaled(x, eps, w1)
+    let z = matrix.mul_f32(y, w2)
+    acc = acc + matrix.get(z, 0, 0)
+    i = i + 1
+  }
+  let el = env.millis() - t0
+  let usc = int.to_float(el) * 1000.0 / int.to_float(iters)
+  let tf = 2 * (seq * d * d) * 2  // 2 matmuls per iter
+  let gflops = int.to_float(tf * iters) / (int.to_float(el) / 1000.0) / 1e9
+  println(label + " seq=" + int.to_string(seq) + " d=" + int.to_string(d) + ": " + int.to_string(el) + "ms " + float.to_string(gflops) + "GF " + float.to_string(usc) + "µs/call (acc=" + float.to_string(acc) + ")")
+}
+
+effect fn main() -> () = {
+  println("Almide f32 chained matmul (realistic NN layer, no activation)")
+  bench("attn", 500, 384, 1000)    // Whisper encoder attention size
+  bench("mlp",  500, 1536, 500)    // Whisper encoder MLP intermediate
+  bench("seq2", 256, 256, 2000)
+  bench("seq4", 512, 512, 500)
+  bench("seq8", 1024, 1024, 100)
+}
