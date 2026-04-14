@@ -1,0 +1,33 @@
+import env
+
+effect fn bench_size(n: Int, iters: Int) -> () = {
+  let a = matrix.ones(n, n) |> (m) => matrix.scale(m, 0.001)
+  let b = matrix.ones(n, n) |> (m) => matrix.scale(m, 0.001)
+  let _w = matrix.get(matrix.mul(a, b), 0, 0)
+  let t0 = env.millis()
+  var i = 0
+  var acc = 0.0
+  while i < iters {
+    let eps = 1.0 + int.to_float(i) * 0.000000001
+    let ai = matrix.scale(a, eps)
+    let r = matrix.mul(ai, b)
+    acc = acc + matrix.get(r, 0, 0)
+    i = i + 1
+  }
+  let el = env.millis() - t0
+  let tf = 2 * n * n * n
+  let gflops = int.to_float(tf * iters) / (int.to_float(el) / 1000.0) / 1e9
+  let usc = int.to_float(el) * 1000.0 / int.to_float(iters)
+  println(int.to_string(n) + "² iter=" + int.to_string(iters) + ": " + int.to_string(el) + "ms " + float.to_string(gflops) + " GFLOPS " + float.to_string(usc) + "µs/call")
+}
+
+effect fn main() -> () = {
+  bench_size(128, 390)
+  bench_size(192, 260)
+  bench_size(256, 195)
+  bench_size(320, 156)
+  bench_size(384, 130)
+  bench_size(512, 97)
+  bench_size(768, 65)
+  bench_size(1024, 48)
+}

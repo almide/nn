@@ -1,0 +1,38 @@
+// Small-matrix matmul. NumPy has ~1µs dispatch overhead — this is the
+// region where AOT Almide should naturally beat NumPy by pure overhead.
+
+import env
+
+effect fn bench_small(label: String, n: Int, iters: Int) -> () = {
+  let a = matrix.ones(n, n) |> (m) => matrix.scale(m, 0.001)
+  let b = matrix.ones(n, n) |> (m) => matrix.scale(m, 0.001)
+  let warm = matrix.mul(a, b)
+  let _ = matrix.get(warm, 0, 0)
+
+  let t0 = env.millis()
+  var i = 0
+  var acc = 0.0
+  while i < iters {
+    let eps = 1.0 + int.to_float(i) * 0.000000001
+    let a_i = matrix.scale(a, eps)
+    let r = matrix.mul(a_i, b)
+    acc = acc + matrix.get(r, 0, 0)
+    i = i + 1
+  }
+  let elapsed_ms = env.millis() - t0
+  let flops_per = 2 * n * n * n
+  let total_flops = iters * flops_per
+  let gflops = int.to_float(total_flops) / (int.to_float(elapsed_ms) / 1000.0) / 1000000000.0
+  let us_per_call = int.to_float(elapsed_ms) * 1000.0 / int.to_float(iters)
+  println(label + " " + int.to_string(n) + "² iters=" + int.to_string(iters) + ": " + int.to_string(elapsed_ms) + "ms → " + float.to_string(gflops) + " GFLOPS (" + float.to_string(us_per_call) + "µs/call, acc=" + float.to_string(acc) + ")")
+}
+
+effect fn main() -> () = {
+  println("Almide small-matrix matmul throughput")
+  bench_small("sq", 3, 100000)
+  bench_small("sq", 8, 100000)
+  bench_small("sq", 16, 100000)
+  bench_small("sq", 32, 10000)
+  bench_small("sq", 64, 10000)
+  bench_small("sq", 128, 1000)
+}

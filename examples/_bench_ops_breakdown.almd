@@ -1,0 +1,31 @@
+// Per-op breakdown to find the real dispatch bottleneck at small sizes.
+import env
+
+effect fn bench_op(label: String, iters: Int, body: () -> Float) -> () = {
+  // warm
+  let _ = body()
+  let t0 = env.millis()
+  var i = 0
+  var acc = 0.0
+  while i < iters {
+    acc = acc + body()
+    i = i + 1
+  }
+  let elapsed = env.millis() - t0
+  let us_per = int.to_float(elapsed) * 1000.0 / int.to_float(iters)
+  println(label + ": " + int.to_string(elapsed) + "ms / " + int.to_string(iters) + " = " + float.to_string(us_per) + "µs/call (acc=" + float.to_string(acc) + ")")
+}
+
+effect fn main() -> () = {
+  let a = matrix.ones(3, 3) |> (m) => matrix.scale(m, 0.001)
+  let b = matrix.ones(3, 3) |> (m) => matrix.scale(m, 0.001)
+
+  println("=== 3x3 op breakdown ===")
+  bench_op("scale only    ", 100000, () => matrix.get(matrix.scale(a, 1.001), 0, 0))
+  bench_op("mul only      ", 100000, () => matrix.get(matrix.mul(a, b), 0, 0))
+  bench_op("get only      ", 100000, () => matrix.get(a, 0, 0))
+  bench_op("scale+mul+get ", 100000, () => {
+    let a_i = matrix.scale(a, 1.001)
+    matrix.get(matrix.mul(a_i, b), 0, 0)
+  })
+}

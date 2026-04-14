@@ -20,8 +20,12 @@ effect fn bench_matmul(label: String, rows_a: Int, cols_a: Int, cols_b: Int, ite
   var i = 0
   var acc = 0.0
   while i < iters {
-    let r = matrix.mul(a, b)
-    // Touch every iteration's result so LLVM can't hoist the call.
+    // Per-iteration scale prevents LLVM/runtime from hoisting the matmul
+    // (input is loop-variant). Cost: 1 scale vs rows_a*cols_a*cols_b FMAs,
+    // i.e. O(1/cols_b) overhead — negligible for meaningful matmul sizes.
+    let eps = 1.0 + int.to_float(i) * 0.000000001
+    let a_i = matrix.scale(a, eps)
+    let r = matrix.mul(a_i, b)
     acc = acc + matrix.get(r, 0, 0)
     i = i + 1
   }
