@@ -1,0 +1,52 @@
+import env
+
+effect fn bf32(n: Int, iters: Int) -> () = {
+  let a = matrix.ones_f32(n, n) |> (m) => matrix.scale(m, 0.001)
+  let b = matrix.ones_f32(n, n) |> (m) => matrix.scale(m, 0.001)
+  let _w = matrix.get(matrix.mul_f32_scaled(a, 1.0, b), 0, 0)
+  let t0 = env.millis()
+  var i = 0
+  var acc = 0.0
+  while i < iters {
+    let eps = 1.0 + int.to_float(i) * 0.000000001
+    let r = matrix.mul_f32_scaled(a, eps, b)
+    acc = acc + matrix.get(r, 0, 0)
+    i = i + 1
+  }
+  let el = env.millis() - t0
+  let usc = int.to_float(el) * 1000.0 / int.to_float(iters)
+  println("f32 " + int.to_string(n) + " " + float.to_string(usc))
+}
+
+effect fn bf64(n: Int, iters: Int) -> () = {
+  let a = matrix.ones(n, n) |> (m) => matrix.scale(m, 0.001)
+  let b = matrix.ones(n, n) |> (m) => matrix.scale(m, 0.001)
+  let _w = matrix.get(matrix.mul_scaled(a, 1.0, b), 0, 0)
+  let t0 = env.millis()
+  var i = 0
+  var acc = 0.0
+  while i < iters {
+    let eps = 1.0 + int.to_float(i) * 0.000000001
+    let r = matrix.mul_scaled(a, eps, b)
+    acc = acc + matrix.get(r, 0, 0)
+    i = i + 1
+  }
+  let el = env.millis() - t0
+  let usc = int.to_float(el) * 1000.0 / int.to_float(iters)
+  println("f64 " + int.to_string(n) + " " + float.to_string(usc))
+}
+
+effect fn main() -> () = {
+  bf32(3, 10000000) bf64(3, 10000000)
+  bf32(8, 3000000)  bf64(8, 3000000)
+  bf32(16, 1500000) bf64(16, 1500000)
+  bf32(32, 500000)  bf64(32, 500000)
+  bf32(64, 200000)  bf64(64, 200000)
+  bf32(128, 50000)  bf64(128, 40000)
+  bf32(192, 20000)  bf64(192, 15000)
+  bf32(256, 10000)  bf64(256, 7000)
+  bf32(384, 3000)   bf64(384, 2000)
+  bf32(512, 1500)   bf64(512, 1000)
+  bf32(768, 500)    bf64(768, 400)
+  bf32(1024, 250)   bf64(1024, 200)
+}

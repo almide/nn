@@ -25,10 +25,10 @@ effect fn bench(label: String, n: Int, iters: Int) -> () = {
 
 effect fn main() -> () = {
   println("Almide f32 matmul throughput (cblas_sgemm direct)")
-  bench("sq", 128, 390)
-  bench("sq", 256, 195)
-  bench("sq", 384, 130)
-  bench("sq", 512, 97)
-  bench("sq", 768, 65)
-  bench("sq", 1024, 48)
+  bench("sq", 128, 20000)
+  bench("sq", 256, 5000)
+  bench("sq", 384, 2000)
+  bench("sq", 512, 1000)
+  bench("sq", 768, 400)
+  bench("sq", 1024, 200)
 }
